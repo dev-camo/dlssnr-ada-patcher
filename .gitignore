@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+.mypy_cache/
+.ruff_cache/
+*.dll
+*.dll.bak
+*.tmp
+fatbin_*/

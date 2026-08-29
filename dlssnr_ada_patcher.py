@@ -1,0 +1,1521 @@
+#!/usr/bin/env python3
+"""Add Ada CUDA images to a user-supplied DLSS Neural Rendering DLL."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import os
+import re
+import shutil
+import stat
+import struct
+import subprocess
+import sys
+import tempfile
+from collections.abc import Sequence
+from dataclasses import dataclass, field
+from pathlib import Path
+
+FATBIN_MAGIC = 0xBA55ED50
+FATBIN_MAGIC_BYTES = struct.pack("<I", FATBIN_MAGIC)
+PE_MACHINE_AMD64 = 0x8664
+PE32_PLUS_MAGIC = 0x20B
+# CUDA names the Ada target sm_89. PTX newer than 9.3 is capped before
+# compilation because this patch targets the Ada toolchain's supported form.
+TARGET_ARCH = 89
+MAX_ADA_PTX_VERSION = (9, 3)
+# NGX uses a different numeric value and name for the host-side Ada checks.
+TARGET_NGX_ARCH = 0x190
+TARGET_NGX_ARCH_NAME = "NVSDK_NGX_GPU_Arch_Ada"
+
+
+class PatchError(RuntimeError):
+    """Report an input or tool error that the user can correct."""
+
+
+@dataclass(frozen=True)
+class PeSection:
+    virtual_address: int
+    virtual_size: int
+    raw_offset: int
+    raw_size: int
+
+
+@dataclass(frozen=True)
+class FatbinLocation:
+    offset: int
+    header_size: int
+    data_size: int
+
+    @property
+    def size(self) -> int:
+        return self.header_size + self.data_size
+
+
+@dataclass(frozen=True)
+class FatbinRecord:
+    offset: int
+    kind: int
+    header_size: int
+    payload_size: int
+    flags: int
+
+
+@dataclass
+class TransformStats:
+    values: dict[str, int] = field(default_factory=dict)
+
+    def add(self, name: str, count: int) -> None:
+        if count:
+            self.values[name] = self.values.get(name, 0) + count
+
+    def summary(self) -> str:
+        if not self.values:
+            return "direct target conversion"
+        return ", ".join(f"{name}={count}" for name, count in self.values.items())
+
+
+@dataclass(frozen=True)
+class CudaTools:
+    cuobjdump: Path
+    ptxas: Path
+    fatbinary: Path
+
+
+@dataclass(frozen=True)
+class Image:
+    kind: str
+    architecture: int
+    path: Path
+
+
+@dataclass(frozen=True)
+class ArchitectureRequirementPatch:
+    interface: str
+    offset: int
+    previous_value: int
+
+
+@dataclass(frozen=True)
+class ArchitectureCasePatch:
+    offset: int
+    success_offset: int
+
+
+@dataclass(frozen=True)
+class HostPatchResult:
+    requirements: tuple[ArchitectureRequirementPatch, ...]
+    ada_cases: tuple[ArchitectureCasePatch, ...]
+    architecture_export_offset: int | None
+    architecture_metadata_offsets: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class OutputPlan:
+    output_path: Path
+    backup_path: Path | None
+
+
+def sha256_bytes(data: bytes | bytearray) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def pe_header_offset(data: bytes | bytearray) -> int:
+    if len(data) < 0x40 or data[:2] != b"MZ":
+        raise PatchError("The input is not a PE file.")
+    pe_offset = struct.unpack_from("<I", data, 0x3C)[0]
+    if pe_offset + 24 > len(data) or data[pe_offset : pe_offset + 4] != b"PE\0\0":
+        raise PatchError("The input has an invalid PE header.")
+    return int(pe_offset)
+
+
+def read_pe_sections(data: bytes | bytearray) -> list[PeSection]:
+    pe_offset = pe_header_offset(data)
+    machine, section_count = struct.unpack_from("<HH", data, pe_offset + 4)
+    if machine != PE_MACHINE_AMD64:
+        raise PatchError(f"The input PE machine is 0x{machine:04x}, not AMD64.")
+    optional_size = struct.unpack_from("<H", data, pe_offset + 20)[0]
+    optional_offset = pe_offset + 24
+    if optional_size < 2 or optional_offset + optional_size > len(data):
+        raise PatchError("The input PE optional header is truncated.")
+    optional_magic = struct.unpack_from("<H", data, optional_offset)[0]
+    if optional_magic != PE32_PLUS_MAGIC:
+        raise PatchError(
+            f"The input optional-header magic is 0x{optional_magic:04x}, not PE32+."
+        )
+    section_table = optional_offset + optional_size
+    if section_table + section_count * 40 > len(data):
+        raise PatchError("The input PE section table is truncated.")
+    sections = []
+    for index in range(section_count):
+        offset = section_table + index * 40
+        virtual_size, virtual_address, raw_size, raw_offset = struct.unpack_from(
+            "<IIII", data, offset + 8
+        )
+        if raw_size and (raw_offset > len(data) or raw_size > len(data) - raw_offset):
+            raise PatchError(f"PE section {index} extends past the input file.")
+        sections.append(PeSection(virtual_address, virtual_size, raw_offset, raw_size))
+    return sections
+
+
+def calculate_pe_checksum(data: bytes | bytearray) -> int:
+    pe_offset = pe_header_offset(data)
+    optional_offset = pe_offset + 24
+    optional_size = struct.unpack_from("<H", data, pe_offset + 20)[0]
+    if optional_size < 68 or optional_offset + optional_size > len(data):
+        raise PatchError("The input PE optional header is truncated.")
+    checksum_offset = optional_offset + 64
+
+    checksum = 0
+    padded_size = (len(data) + 3) & ~3
+    for offset in range(0, padded_size, 4):
+        if offset == checksum_offset:
+            continue
+        chunk = bytes(data[offset : offset + 4]).ljust(4, b"\0")
+        checksum += struct.unpack("<I", chunk)[0]
+        if checksum >= 1 << 32:
+            checksum = (checksum & 0xFFFFFFFF) + (checksum >> 32)
+    checksum = (checksum & 0xFFFF) + (checksum >> 16)
+    checksum += checksum >> 16
+    return (checksum & 0xFFFF) + len(data)
+
+
+def update_pe_checksum(data: bytearray) -> int:
+    pe_offset = pe_header_offset(data)
+    checksum = calculate_pe_checksum(data)
+    struct.pack_into("<I", data, pe_offset + 24 + 64, checksum)
+    return checksum
+
+
+def rva_to_file_offset(rva: int, sections: Sequence[PeSection]) -> int | None:
+    for section in sections:
+        size = max(section.virtual_size, section.raw_size)
+        if section.virtual_address <= rva < section.virtual_address + size:
+            raw = section.raw_offset + rva - section.virtual_address
+            if raw < section.raw_offset + section.raw_size:
+                return raw
+    return None
+
+
+def read_c_string(data: bytes | bytearray, offset: int, limit: int = 1024) -> str:
+    if not 0 <= offset < len(data):
+        return ""
+    end = data.find(b"\0", offset, min(len(data), offset + limit))
+    if end < 0:
+        return ""
+    return bytes(data[offset:end]).decode("ascii", errors="replace")
+
+
+def read_pe_exports(
+    data: bytes | bytearray, sections: Sequence[PeSection]
+) -> dict[str, int]:
+    """Return named PE exports as RVAs."""
+    pe_offset = pe_header_offset(data)
+    optional_offset = pe_offset + 24
+    optional_size = struct.unpack_from("<H", data, pe_offset + 20)[0]
+    # The PE32+ NumberOfRvaAndSizes and data-directory fields start here.
+    if optional_size < 120 or optional_offset + optional_size > len(data):
+        raise PatchError("The input PE optional header has no export directory.")
+    if struct.unpack_from("<H", data, optional_offset)[0] != PE32_PLUS_MAGIC:
+        raise PatchError("The input is not a PE32+ image.")
+    directory_count = struct.unpack_from("<I", data, optional_offset + 108)[0]
+    if directory_count < 1:
+        return {}
+    export_rva, export_size = struct.unpack_from("<II", data, optional_offset + 112)
+    if not export_rva or not export_size:
+        return {}
+    export_offset = rva_to_file_offset(export_rva, sections)
+    if export_offset is None or export_offset + 40 > len(data):
+        raise PatchError("The PE export directory is outside the input file.")
+
+    function_count, name_count, functions_rva, names_rva, ordinals_rva = (
+        struct.unpack_from("<IIIII", data, export_offset + 20)
+    )
+    if function_count > 100_000 or name_count > 100_000:
+        raise PatchError("The PE export table has an invalid entry count.")
+
+    def table_offset(rva: int, size: int, label: str) -> int:
+        offset = rva_to_file_offset(rva, sections)
+        if offset is None or offset > len(data) or size > len(data) - offset:
+            raise PatchError(f"The PE export {label} table is truncated.")
+        return offset
+
+    functions_offset = table_offset(functions_rva, function_count * 4, "address")
+    names_offset = table_offset(names_rva, name_count * 4, "name")
+    ordinals_offset = table_offset(ordinals_rva, name_count * 2, "ordinal")
+    exports: dict[str, int] = {}
+    for index in range(name_count):
+        name_rva = struct.unpack_from("<I", data, names_offset + index * 4)[0]
+        name_offset = rva_to_file_offset(name_rva, sections)
+        if name_offset is None:
+            raise PatchError("A PE export name is outside the input file.")
+        name = read_c_string(data, name_offset)
+        if not name:
+            raise PatchError("A PE export name is invalid.")
+        ordinal = struct.unpack_from("<H", data, ordinals_offset + index * 2)[0]
+        if ordinal >= function_count:
+            raise PatchError(f"PE export '{name}' has an invalid ordinal.")
+        function_rva = struct.unpack_from("<I", data, functions_offset + ordinal * 4)[0]
+        if name in exports:
+            raise PatchError(f"The PE has duplicate export name '{name}'.")
+        exports[name] = function_rva
+    return exports
+
+
+def find_fatbins(data: bytes | bytearray) -> list[FatbinLocation]:
+    # Fatbins can appear anywhere in the PE data. Later code replaces each
+    # container in place, so offsets outside a matched container stay stable.
+    locations: list[FatbinLocation] = []
+    search_at = 0
+    covered_until = 0
+    while True:
+        offset = data.find(FATBIN_MAGIC_BYTES, search_at)
+        if offset < 0:
+            break
+        search_at = offset + len(FATBIN_MAGIC_BYTES)
+        if offset < covered_until or offset + 16 > len(data):
+            continue
+        magic, version, header_size, data_size = struct.unpack_from(
+            "<IHHQ", data, offset
+        )
+        size = header_size + data_size
+        if (
+            magic != FATBIN_MAGIC
+            or version != 1
+            or header_size < 16
+            or size < header_size
+            or offset + size > len(data)
+        ):
+            continue
+        locations.append(FatbinLocation(offset, header_size, data_size))
+        covered_until = offset + size
+    if not locations:
+        raise PatchError("The input has no supported CUDA fatbins.")
+    return locations
+
+
+def parse_fatbin_records(blob: bytes | bytearray) -> list[FatbinRecord]:
+    if len(blob) < 16:
+        raise PatchError("A CUDA fatbin is too small.")
+    magic, version, fat_header_size, data_size = struct.unpack_from("<IHHQ", blob, 0)
+    if magic != FATBIN_MAGIC or version != 1:
+        raise PatchError("A CUDA fatbin header is invalid.")
+    end = fat_header_size + data_size
+    if fat_header_size < 16 or end != len(blob):
+        raise PatchError("A CUDA fatbin length does not match its header.")
+
+    records: list[FatbinRecord] = []
+    offset = fat_header_size
+    while offset < end:
+        if offset + 48 > end:
+            raise PatchError("A CUDA fatbin record header is truncated.")
+        kind, _version, header_size = struct.unpack_from("<HHI", blob, offset)
+        payload_size = struct.unpack_from("<Q", blob, offset + 8)[0]
+        flags = struct.unpack_from("<Q", blob, offset + 40)[0]
+        next_offset = offset + header_size + payload_size
+        if header_size < 48 or next_offset <= offset or next_offset > end:
+            raise PatchError("A CUDA fatbin record has an invalid length.")
+        records.append(FatbinRecord(offset, kind, header_size, payload_size, flags))
+        offset = next_offset
+    if offset != end:
+        raise PatchError("A CUDA fatbin record extends past its container.")
+    return records
+
+
+def preserve_record_flags(generated: bytes, source: bytes) -> bytes:
+    output = bytearray(generated)
+    source_records = parse_fatbin_records(source)
+    generated_records = parse_fatbin_records(output)
+    source_low_flags: dict[int, int] = {}
+    for record in source_records:
+        source_low_flags.setdefault(record.kind, record.flags & 0xFF)
+    for record in generated_records:
+        if record.kind not in source_low_flags:
+            continue
+        flags = record.flags
+        flags = (flags & ~0xFF) | source_low_flags[record.kind]
+        struct.pack_into("<Q", output, record.offset + 40, flags)
+    return bytes(output)
+
+
+def tool_error(
+    command: Sequence[os.PathLike[str] | str], result: subprocess.CompletedProcess[str]
+) -> str:
+    text = "\n".join(part for part in (result.stdout, result.stderr) if part).strip()
+    lines = text.splitlines()
+    if len(lines) > 30:
+        lines = lines[:10] + ["... output omitted ..."] + lines[-19:]
+    rendered = " ".join(str(item) for item in command)
+    detail = "\n".join(lines)
+    return f"Command failed with exit code {result.returncode}: {rendered}\n{detail}".rstrip()
+
+
+def run_tool(
+    command: Sequence[os.PathLike[str] | str],
+    *,
+    cwd: Path | None = None,
+) -> subprocess.CompletedProcess[str]:
+    try:
+        result = subprocess.run(
+            [str(item) for item in command],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+    except OSError as error:
+        rendered = " ".join(str(item) for item in command)
+        raise PatchError(f"Cannot run command '{rendered}': {error}") from error
+    if result.returncode:
+        raise PatchError(tool_error(command, result))
+    return result
+
+
+def find_cuda_tool(name: str, cuda_bin: Path | None) -> Path:
+    names = [name]
+    if os.name == "nt":
+        names.insert(0, f"{name}.exe")
+    if cuda_bin is not None:
+        for candidate_name in names:
+            candidate = cuda_bin / candidate_name
+            if candidate.is_file():
+                return candidate.resolve()
+        raise PatchError(f"CUDA tool '{name}' is not in {cuda_bin}.")
+    for candidate_name in names:
+        found = shutil.which(candidate_name)
+        if found:
+            return Path(found).resolve()
+    raise PatchError(
+        f"CUDA tool '{name}' is not on PATH. Install CUDA Toolkit 13.3 or use --cuda-bin."
+    )
+
+
+def find_cuda_tools(cuda_bin: Path | None) -> CudaTools:
+    return CudaTools(
+        cuobjdump=find_cuda_tool("cuobjdump", cuda_bin),
+        ptxas=find_cuda_tool("ptxas", cuda_bin),
+        fatbinary=find_cuda_tool("fatbinary", cuda_bin),
+    )
+
+
+def cuda_version(ptxas: Path) -> str:
+    result = run_tool([ptxas, "--version"])
+    text = f"{result.stdout}\n{result.stderr}"
+    match = re.search(r"release\s+([0-9]+(?:\.[0-9]+)*)", text)
+    return match.group(1) if match else "unknown"
+
+
+def parse_listed_images(output: str, label: str) -> list[str]:
+    pattern = re.compile(
+        rf"^\s*{re.escape(label)}\s+file\s+\d+\s*:\s*(.+?)\s*$",
+        re.IGNORECASE,
+    )
+    names = []
+    for line in output.splitlines():
+        match = pattern.match(line)
+        if match:
+            names.append(Path(match.group(1)).name)
+    return names
+
+
+def image_architecture(path: Path) -> int:
+    match = re.search(r"\.sm_(\d+)[a-z]?\.(?:ptx|cubin)$", path.name, re.IGNORECASE)
+    if not match:
+        raise PatchError(f"Cannot read the CUDA architecture from '{path.name}'.")
+    return int(match.group(1))
+
+
+def extract_images(fatbin_path: Path, work_dir: Path, cuobjdump: Path) -> list[Image]:
+    ptx_list = run_tool([cuobjdump, "--list-ptx", fatbin_path]).stdout
+    elf_list = run_tool([cuobjdump, "--list-elf", fatbin_path]).stdout
+    ptx_names = parse_listed_images(ptx_list, "PTX")
+    elf_names = parse_listed_images(elf_list, "ELF")
+    if not ptx_names or not elf_names:
+        raise PatchError("A CUDA fatbin does not contain both PTX and ELF images.")
+
+    run_tool([cuobjdump, "--extract-ptx", "all", fatbin_path], cwd=work_dir)
+    run_tool([cuobjdump, "--extract-elf", "all", fatbin_path], cwd=work_dir)
+
+    ptx_images = [
+        Image("ptx", image_architecture(work_dir / name), work_dir / name)
+        for name in ptx_names
+    ]
+    elf_images = [
+        Image("elf", image_architecture(work_dir / name), work_dir / name)
+        for name in elf_names
+    ]
+    for image in ptx_images + elf_images:
+        if not image.path.is_file():
+            raise PatchError(f"cuobjdump did not create '{image.path.name}'.")
+
+    source_records = parse_fatbin_records(fatbin_path.read_bytes())
+    ptx_index = 0
+    elf_index = 0
+    ordered: list[Image] = []
+    for record in source_records:
+        if record.kind == 1:
+            if ptx_index >= len(ptx_images):
+                raise PatchError(
+                    "The PTX record count does not match cuobjdump output."
+                )
+            ordered.append(ptx_images[ptx_index])
+            ptx_index += 1
+        elif record.kind == 2:
+            if elf_index >= len(elf_images):
+                raise PatchError(
+                    "The ELF record count does not match cuobjdump output."
+                )
+            ordered.append(elf_images[elf_index])
+            elf_index += 1
+        else:
+            raise PatchError(f"Unsupported CUDA fatbin record kind {record.kind}.")
+    if ptx_index != len(ptx_images) or elf_index != len(elf_images):
+        raise PatchError("The CUDA image count does not match the fatbin records.")
+    return ordered
+
+
+def normalize_crlf(data: bytes) -> bytes:
+    return data.replace(b"\r\n", b"\n").replace(b"\r", b"\n").replace(b"\n", b"\r\n")
+
+
+def parse_ptx_target(text: str) -> int:
+    matches = re.findall(r"(?m)^\s*\.target\s+sm_(\d+)[a-z]?\b", text)
+    if len(matches) != 1:
+        raise PatchError(f"Expected one PTX target directive, found {len(matches)}.")
+    return int(matches[0])
+
+
+def previous_mov_assignment(
+    text: str, position: int, register: str, limit: int = 4000
+) -> str:
+    start = max(0, position - limit)
+    pattern = re.compile(r"mov\.b32\s+" + re.escape(register) + r",\s*([^;]+?)\s*;")
+    matches = list(pattern.finditer(text, start, position))
+    if not matches:
+        raise PatchError(f"Cannot find an assignment for PTX register {register}.")
+    return matches[-1].group(1).strip()
+
+
+def previous_literal_assignment(
+    text: str, position: int, register: str, limit: int = 4000
+) -> int:
+    value = previous_mov_assignment(text, position, register, limit)
+    if not re.fullmatch(r"\d+", value):
+        raise PatchError(
+            f"The previous assignment for PTX register {register} is not a literal."
+        )
+    return int(value)
+
+
+def transform_ptx(source: str) -> tuple[str, TransformStats]:
+    # Keep these conversions narrow. If an instruction has an unknown form,
+    # fail instead of producing PTX that may run incorrectly on Ada.
+    stats = TransformStats()
+
+    # Recompile the embedded program for Ada. Limit the PTX version before
+    # ptxas sees it; the selected toolchain supports PTX 9.3 for this target.
+    version_pattern = re.compile(r"(?m)^(\s*\.version\s+)(\d+)\.(\d+)(\s*)$")
+    version_matches = list(version_pattern.finditer(source))
+    if len(version_matches) != 1:
+        raise PatchError(
+            f"Expected one PTX version directive, found {len(version_matches)}."
+        )
+
+    def replace_version(match: re.Match[str]) -> str:
+        version = (int(match.group(2)), int(match.group(3)))
+        if version <= MAX_ADA_PTX_VERSION:
+            return match.group(0)
+        stats.add("ptx_version", 1)
+        return f"{match.group(1)}{MAX_ADA_PTX_VERSION[0]}.{MAX_ADA_PTX_VERSION[1]}{match.group(4)}"
+
+    output = version_pattern.sub(replace_version, source)
+
+    target_pattern = re.compile(r"(?m)^(\s*\.target\s+)sm_\d+[a-z]?(.*)$")
+    target_matches = list(target_pattern.finditer(output))
+    if len(target_matches) != 1:
+        raise PatchError(
+            f"Expected one PTX target directive, found {len(target_matches)}."
+        )
+    output = target_pattern.sub(rf"\g<1>sm_{TARGET_ARCH}\2", output)
+    stats.add("target", 1)
+
+    # Ada has no equivalent for the newer warp bulk-copy instruction. Accept
+    # only ordered elect/copy/expect groups whose barrier operands match.
+    predicate = r"(?:%p\d+|[A-Za-z_][\w$]*)"
+    elect_pattern = re.compile(rf"elect\.sync\s+_\|({predicate}),\s*%r\d+\s*;")
+    bulk_pattern = re.compile(
+        r"cp\.async\.bulk\.shared::cta\.global\.mbarrier::complete_tx::bytes\s+"
+        r"\[(%r\d+)\],\s*\[(%rd\d+)\],\s*(%r\d+),\s*\[(%r\d+)\]\s*;"
+    )
+    expect_pattern = re.compile(
+        r"mbarrier\.expect_tx(?:\.[A-Za-z0-9_:]+)*\s+"
+        r"\[(%r\d+)\],\s*(%r\d+)\s*;"
+    )
+    elect_matches = list(elect_pattern.finditer(output))
+    bulk_matches = list(bulk_pattern.finditer(output))
+    expect_matches = list(expect_pattern.finditer(output))
+    generic_elects = list(re.finditer(r"\belect\.sync\b", output))
+    generic_bulks = list(re.finditer(r"\bcp\.async\.bulk\b", output))
+    generic_expects = list(re.finditer(r"\bmbarrier\.expect_tx\b", output))
+    if len(elect_matches) != len(generic_elects):
+        raise PatchError("An elect operation has an unsupported form.")
+    if len(bulk_matches) != len(generic_bulks):
+        raise PatchError("A bulk-copy operation has an unsupported form.")
+    if len(expect_matches) != len(generic_expects):
+        raise PatchError("A transaction expectation has an unsupported form.")
+
+    ordered_copy_operations = sorted(
+        [(match.start(), "elect") for match in elect_matches]
+        + [(match.start(), "bulk") for match in bulk_matches]
+        + [(match.start(), "expect") for match in expect_matches]
+    )
+    expected_copy_order = ["elect", "bulk", "expect"] * len(bulk_matches)
+    if [name for _position, name in ordered_copy_operations] != expected_copy_order:
+        raise PatchError(
+            "PTX elect, bulk-copy, and transaction-expectation operations are not "
+            "ordered in supported groups."
+        )
+    for elect, bulk, expect in zip(
+        elect_matches, bulk_matches, expect_matches, strict=True
+    ):
+        if elect.group(1) not in output[elect.end() : bulk.start()]:
+            raise PatchError("An elected predicate does not control its bulk copy.")
+        if (bulk.group(4), bulk.group(3)) != (expect.group(1), expect.group(2)):
+            raise PatchError(
+                "A bulk copy and its transaction expectation do not match."
+            )
+
+    # Arrival and wait operations must also form ordered pairs for the same
+    # barrier state. Generated PTX can calculate the same storage in different
+    # registers, so the state token is the stable relationship.
+    arrive_pattern = re.compile(
+        r"mbarrier\.arrive\.shared::cta\.b64\s+"
+        r"(%rd\d+),\s*\[(%r\d+)\],\s*(%r\d+)\s*;"
+    )
+    wait_pattern = re.compile(
+        rf"mbarrier\.try_wait\.shared::cta\.b64\s+"
+        rf"({predicate}),\s*\[(%r\d+)\],\s*(%rd\d+)\s*;"
+    )
+    arrive_matches = list(arrive_pattern.finditer(output))
+    wait_matches = list(wait_pattern.finditer(output))
+    generic_arrivals = list(
+        re.finditer(r"\bmbarrier\.arrive\.shared::cta\.b64\b", output)
+    )
+    generic_waits = list(
+        re.finditer(r"\bmbarrier\.try_wait\.shared::cta\.b64\b", output)
+    )
+    if len(arrive_matches) != len(generic_arrivals):
+        raise PatchError("A barrier-arrival operation has an unsupported form.")
+    if len(wait_matches) != len(generic_waits):
+        raise PatchError("A barrier-wait operation has an unsupported form.")
+    ordered_barriers = sorted(
+        [(match.start(), "arrive") for match in arrive_matches]
+        + [(match.start(), "wait") for match in wait_matches]
+    )
+    expected_barrier_order = ["arrive", "wait"] * len(arrive_matches)
+    if [name for _position, name in ordered_barriers] != expected_barrier_order:
+        raise PatchError("PTX barrier arrivals and waits are not ordered in pairs.")
+    for arrive, wait in zip(arrive_matches, wait_matches, strict=True):
+        if arrive.group(1) != wait.group(3):
+            raise PatchError(
+                "A barrier arrival and wait use different state registers."
+            )
+        count = previous_literal_assignment(output, arrive.start(), arrive.group(3))
+        if count != 1:
+            raise PatchError(f"Unsupported mbarrier arrival count {count}.")
+
+    # The supported 512- and 1024-byte bulk forms become per-lane 16-byte
+    # copies. Each lane waits for its normal async-copy group before arrival.
+    def replace_bulk(match: re.Match[str]) -> str:
+        destination, source_address, size_register, _barrier = match.groups()
+        copy_size = previous_literal_assignment(output, match.start(), size_register)
+        if copy_size not in (512, 1024):
+            raise PatchError(f"Unsupported bulk-copy size {copy_size} bytes.")
+        copies = []
+        for offset in range(0, copy_size, 512):
+            suffix = f"+{offset}" if offset else ""
+            copies.append(
+                "cp.async.cg.shared.global "
+                f"[dlss5_address{suffix}], [dlss5_source{suffix}], 16;"
+            )
+        operations = "\n".join(copies)
+        return (
+            "{\n"
+            ".reg .u32 dlss5_lane, dlss5_offset, dlss5_address;\n"
+            ".reg .u64 dlss5_offset64, dlss5_source;\n"
+            "mov.u32 dlss5_lane, %laneid;\n"
+            "shl.b32 dlss5_offset, dlss5_lane, 4;\n"
+            f"add.s32 dlss5_address, {destination}, dlss5_offset;\n"
+            "cvt.u64.u32 dlss5_offset64, dlss5_offset;\n"
+            f"add.s64 dlss5_source, {source_address}, dlss5_offset64;\n"
+            f"{operations}\n"
+            "cp.async.commit_group;\n"
+            "cp.async.wait_group 0;\n"
+            "}"
+        )
+
+    output, bulk_count = bulk_pattern.subn(replace_bulk, output)
+    stats.add("bulk_copy", bulk_count)
+
+    # The expanded copies run in every lane, so no elected lane is needed.
+    output, replaced_elect = elect_pattern.subn(r"mov.pred \1, 1;", output)
+    stats.add("elect", replaced_elect)
+
+    # A normal async-copy group does not use the original transaction-size
+    # expectation.
+    output, expect_count = expect_pattern.subn("", output)
+    stats.add("expect_tx", expect_count)
+
+    # Use Ada's one-arrival and test-wait barrier forms.
+    output, arrive_count = arrive_pattern.subn(
+        r"mbarrier.arrive.shared::cta.b64 \1, [\2];", output
+    )
+    stats.add("barrier_arrive", arrive_count)
+    output, wait_count = wait_pattern.subn(
+        r"mbarrier.test_wait.shared::cta.b64 \1, [\2], \3;", output
+    )
+    stats.add("barrier_wait", wait_count)
+
+    # Ada does not support the four-value vector reduction. Preserve its four
+    # values as separate packed-half reductions at adjacent addresses.
+    reduction_pattern = re.compile(
+        r"red\.global\.v4\.f16x2\.add\.noftz\s+\[(%rd\d+)\],\s*"
+        r"\{\s*(%r\d+),\s*(%r\d+),\s*(%r\d+),\s*(%r\d+)\s*\}\s*;"
+    )
+
+    def replace_reduction(match: re.Match[str]) -> str:
+        address, *values = match.groups()
+        lines = []
+        for index, value in enumerate(values):
+            suffix = f"+{index * 4}" if index else ""
+            lines.append(f"red.global.f16x2.add.noftz [{address}{suffix}], {value};")
+        return "\n".join(lines)
+
+    output, reduction_count = reduction_pattern.subn(replace_reduction, output)
+    stats.add("vector_reduction", reduction_count)
+
+    # Use the acquire-release fence accepted by Ada in place of release-only.
+    fence_count = output.count("fence.release.gpu;")
+    output = output.replace("fence.release.gpu;", "fence.acq_rel.gpu;")
+    stats.add("release_fence", fence_count)
+
+    # Expand fused signed minimum/ReLU into operations that Ada supports.
+    min_relu_pattern = re.compile(r"min\.relu\.s32\s+(%r\d+),\s*(%r\d+),\s*(%r\d+)\s*;")
+    output, min_relu_count = min_relu_pattern.subn(
+        r"min.s32 \1, \2, \3;\nmax.s32 \1, \1, 0;", output
+    )
+    stats.add("min_relu", min_relu_count)
+
+    unsupported = (
+        "elect.sync",
+        "cp.async.bulk",
+        "mbarrier.expect_tx",
+        "mbarrier.try_wait",
+        "red.global.v4",
+        "min.relu",
+        "fence.release.gpu",
+    )
+    remaining = [token for token in unsupported if token in output]
+    if remaining:
+        raise PatchError(
+            "Unsupported PTX remains after conversion: " + ", ".join(remaining)
+        )
+    return output, stats
+
+
+def is_ngx_architecture(value: int) -> bool:
+    return 0x100 <= value <= 0x400 and value & 0xF == 0
+
+
+def exported_function_range(
+    data: bytes | bytearray,
+    sections: Sequence[PeSection],
+    exports: dict[str, int],
+    name: str,
+    *,
+    maximum_size: int = 4096,
+) -> tuple[int, int]:
+    start_rva = exports[name]
+    start = rva_to_file_offset(start_rva, sections)
+    if start is None:
+        raise PatchError(f"PE export '{name}' is outside the input file.")
+    next_rva = min(
+        (rva for rva in set(exports.values()) if rva > start_rva),
+        default=start_rva + maximum_size,
+    )
+    rva_size = min(maximum_size, next_rva - start_rva)
+    section_end = len(data)
+    for section in sections:
+        if section.raw_offset <= start < section.raw_offset + section.raw_size:
+            section_end = section.raw_offset + section.raw_size
+            break
+    end = min(len(data), section_end, start + rva_size)
+    if end <= start:
+        raise PatchError(f"PE export '{name}' has an invalid code range.")
+    return start, end
+
+
+def decode_stack_immediate(
+    data: bytes | bytearray, offset: int, end: int
+) -> tuple[int, int, int, int] | None:
+    """Decode `mov dword ptr [rsp+displacement], immediate`."""
+    if offset + 8 <= end and data[offset : offset + 3] == b"\xc7\x44\x24":
+        displacement = struct.unpack_from("<b", data, offset + 3)[0]
+        immediate_offset = offset + 4
+        value = struct.unpack_from("<I", data, immediate_offset)[0]
+        return displacement, immediate_offset, value, 8
+    if offset + 11 <= end and data[offset : offset + 3] == b"\xc7\x84\x24":
+        displacement = struct.unpack_from("<i", data, offset + 3)[0]
+        immediate_offset = offset + 7
+        value = struct.unpack_from("<I", data, immediate_offset)[0]
+        return displacement, immediate_offset, value, 11
+    return None
+
+
+def find_requirement_architecture(
+    data: bytes | bytearray, start: int, end: int, export_name: str
+) -> tuple[int, int]:
+    assignments: list[tuple[int, int, int, int, int]] = []
+    for offset in range(start, end):
+        decoded = decode_stack_immediate(data, offset, end)
+        if decoded is not None:
+            displacement, immediate_offset, value, size = decoded
+            assignments.append((offset, displacement, immediate_offset, value, size))
+
+    candidates: list[tuple[int, int]] = []
+    for (
+        first_offset,
+        first_displacement,
+        _first_immediate,
+        first_value,
+        first_size,
+    ) in assignments:
+        if first_value != 0x12:
+            continue
+        for (
+            second_offset,
+            displacement,
+            immediate_offset,
+            value,
+            _second_size,
+        ) in assignments:
+            if not first_offset + first_size <= second_offset <= first_offset + 64:
+                continue
+            if displacement != first_displacement + 4:
+                continue
+            if value == 0 or is_ngx_architecture(value):
+                candidates.append((immediate_offset, value))
+    candidates = list(dict.fromkeys(candidates))
+    if len(candidates) != 1:
+        raise PatchError(
+            f"Expected one architecture requirement in export '{export_name}', found "
+            f"{len(candidates)}."
+        )
+    return candidates[0]
+
+
+def patch_minimum_architectures(
+    data: bytearray,
+    sections: Sequence[PeSection],
+    exports: dict[str, int],
+) -> tuple[ArchitectureRequirementPatch, ...]:
+    pattern = re.compile(r"^NVSDK_NGX_([A-Z0-9_]+)_GetFeatureRequirements$")
+    requirement_exports = sorted(
+        (match.group(1), name)
+        for name in exports
+        if (match := pattern.fullmatch(name)) is not None
+    )
+    if not requirement_exports:
+        raise PatchError("The PE has no NGX feature-requirement exports.")
+
+    patches: list[ArchitectureRequirementPatch] = []
+    for interface, name in requirement_exports:
+        start, end = exported_function_range(data, sections, exports, name)
+        offset, previous_value = find_requirement_architecture(data, start, end, name)
+        patches.append(ArchitectureRequirementPatch(interface, offset, previous_value))
+
+    # Different interface names can alias one implementation. Patch each
+    # unique requirement only after every exported implementation validates.
+    unique_requirements = dict.fromkeys(
+        (patch.offset, patch.previous_value) for patch in patches
+    )
+    for offset, previous_value in unique_requirements:
+        if previous_value > TARGET_NGX_ARCH:
+            struct.pack_into("<I", data, offset, TARGET_NGX_ARCH)
+    return tuple(patches)
+
+
+def patch_exported_architecture(
+    data: bytearray,
+    sections: Sequence[PeSection],
+    exports: dict[str, int],
+) -> tuple[int, int] | None:
+    name = "NVSDK_NGX_GetGPUArchitecture"
+    if name not in exports:
+        return None
+    start, end = exported_function_range(data, sections, exports, name, maximum_size=64)
+    candidates: list[tuple[int, int]] = []
+    for offset in range(start, max(start, end - 5)):
+        if data[offset] != 0xB8 or data[offset + 5] != 0xC3:
+            continue
+        value = struct.unpack_from("<I", data, offset + 1)[0]
+        if value == 0 or is_ngx_architecture(value):
+            candidates.append((offset + 1, value))
+    if len(candidates) != 1:
+        raise PatchError(
+            f"Expected one architecture value in export '{name}', found "
+            f"{len(candidates)}."
+        )
+    immediate_offset, previous_value = candidates[0]
+    if previous_value > TARGET_NGX_ARCH:
+        struct.pack_into("<I", data, immediate_offset, TARGET_NGX_ARCH)
+    return immediate_offset, previous_value
+
+
+def patch_architecture_metadata(
+    data: bytearray, *, lower_architecture: bool
+) -> tuple[int, ...]:
+    if not lower_architecture:
+        return ()
+    key = "NGXGpuArchitecture\0".encode("utf-16le")
+    key_offsets: list[int] = []
+    position = 0
+    while True:
+        position = data.find(key, position)
+        if position < 0:
+            break
+        key_offsets.append(position)
+        position += len(key)
+
+    patched_offsets: list[int] = []
+    for key_offset in key_offsets:
+        header_offset = key_offset - 6
+        if header_offset < 0:
+            raise PatchError("The NGX architecture metadata header is truncated.")
+        length, value_length, value_type = struct.unpack_from(
+            "<HHH", data, header_offset
+        )
+        value_offset = (key_offset + len(key) + 3) & ~3
+        value_size = value_length * 2
+        if (
+            value_type != 1
+            or not value_length
+            or length < value_offset + value_size - header_offset
+            or header_offset + length > len(data)
+        ):
+            raise PatchError("The NGX architecture metadata entry is invalid.")
+        try:
+            value = bytes(data[value_offset : value_offset + value_size]).decode(
+                "utf-16le"
+            )
+        except UnicodeDecodeError as error:
+            raise PatchError(
+                "The NGX architecture metadata is not UTF-16LE."
+            ) from error
+        value = value.split("\0", 1)[0]
+        if not value.startswith("NVSDK_NGX_GPU_Arch_"):
+            raise PatchError(f"Unexpected NGX architecture metadata value '{value}'.")
+        if value == TARGET_NGX_ARCH_NAME:
+            continue
+        replacement = (TARGET_NGX_ARCH_NAME + "\0").encode("utf-16le")
+        if len(replacement) > value_size:
+            raise PatchError(
+                "The Ada architecture name does not fit the metadata entry."
+            )
+        data[value_offset : value_offset + value_size] = replacement.ljust(
+            value_size, b"\0"
+        )
+        struct.pack_into("<H", data, header_offset + 2, len(TARGET_NGX_ARCH_NAME) + 1)
+        patched_offsets.append(value_offset)
+    return tuple(patched_offsets)
+
+
+def decode_architecture_case_entry(
+    data: bytes | bytearray, offset: int, register: int
+) -> tuple[int, int] | None:
+    if (
+        offset < 0
+        or offset + 7 > len(data)
+        or data[offset] != 0xB8 + register
+        or data[offset + 5] != 0xEB
+    ):
+        return None
+    value = struct.unpack_from("<I", data, offset + 1)[0]
+    if not is_ngx_architecture(value):
+        return None
+    target = offset + 7 + struct.unpack_from("<b", data, offset + 6)[0]
+    return value, target
+
+
+def find_success_target(
+    data: bytes | bytearray, cases_end: int, failure_target: int
+) -> int | None:
+    if not cases_end <= failure_target <= len(data):
+        return None
+    search_end = min(failure_target, cases_end + 64)
+    compare = data.find(b"\x3d", cases_end, search_end)
+    while compare >= 0:
+        if compare + 5 <= len(data):
+            lower_bound = struct.unpack_from("<I", data, compare + 1)[0]
+            if is_ngx_architecture(lower_bound) and lower_bound <= TARGET_NGX_ARCH:
+                branch = compare + 5
+                if branch + 2 == failure_target and data[branch] == 0x7D:
+                    target = branch + 2 + struct.unpack_from("<b", data, branch + 1)[0]
+                    return target if 0 <= target < len(data) else None
+                if (
+                    branch + 6 == failure_target
+                    and data[branch : branch + 2] == b"\x0f\x8d"
+                ):
+                    target = branch + 6 + struct.unpack_from("<i", data, branch + 2)[0]
+                    return target if 0 <= target < len(data) else None
+        compare = data.find(b"\x3d", compare + 1, search_end)
+    return None
+
+
+def find_architecture_cases(
+    data: bytes | bytearray,
+) -> list[tuple[int, int, int, int]]:
+    candidates: list[tuple[int, int, int, int]] = []
+    for register in range(8):
+        # RSP cannot hold a normal architecture case value.
+        if register == 4:
+            continue
+        marker = (
+            bytes((0xB8 + register,)) + struct.pack("<I", TARGET_NGX_ARCH) + b"\xeb"
+        )
+        position = 0
+        while True:
+            ada_offset = data.find(marker, position)
+            if ada_offset < 0:
+                break
+            position = ada_offset + 1
+            ada_entry = decode_architecture_case_entry(data, ada_offset, register)
+            if ada_entry is None:
+                continue
+            _ada_value, failure_target = ada_entry
+            start = ada_offset
+            while True:
+                previous = decode_architecture_case_entry(data, start - 7, register)
+                if previous is None or previous[1] != failure_target:
+                    break
+                start -= 7
+            end = ada_offset + 7
+            while True:
+                following = decode_architecture_case_entry(data, end, register)
+                if following is None or following[1] != failure_target:
+                    break
+                end += 7
+            entries = [
+                decode_architecture_case_entry(data, offset, register)
+                for offset in range(start, end, 7)
+            ]
+            values = [entry[0] for entry in entries if entry is not None]
+            if (
+                len(values) < 4
+                or len(values) != len(set(values))
+                or min(values) >= TARGET_NGX_ARCH
+                or max(values) <= TARGET_NGX_ARCH
+                or not end <= failure_target <= end + 64
+            ):
+                continue
+            success = find_success_target(data, end, failure_target)
+            if success is not None:
+                candidates.append((ada_offset, register, failure_target, success))
+    candidates = list(dict.fromkeys(candidates))
+    if not candidates:
+        raise PatchError("Cannot find a supported GPU architecture case table.")
+    return candidates
+
+
+def patch_ada_cases(data: bytearray) -> tuple[ArchitectureCasePatch, ...]:
+    candidates = find_architecture_cases(data)
+    patches: list[ArchitectureCasePatch] = []
+    for ada_offset, register, _failure, success in candidates:
+        # Redirect the Ada entry to the existing success block. Both the short
+        # and near forms keep the replacement seven bytes long.
+        xor_modrm = 0xC0 | (register << 3) | register
+        displacement = success - (ada_offset + 7)
+        if -128 <= displacement <= 127:
+            replacement = bytes(
+                (0x33, xor_modrm, 0x90, 0x90, 0x90, 0xEB, displacement & 0xFF)
+            )
+        elif -(1 << 31) <= displacement < 1 << 31:
+            replacement = bytes((0x33, xor_modrm, 0xE9)) + struct.pack(
+                "<i", displacement
+            )
+        else:
+            raise PatchError("An Ada success target is out of range.")
+        data[ada_offset : ada_offset + 7] = replacement
+        patches.append(ArchitectureCasePatch(ada_offset, success))
+    return tuple(patches)
+
+
+def patch_ada_case(data: bytearray) -> tuple[int, int]:
+    """Patch one case table for callers that use the former helper."""
+    patches = patch_ada_cases(data)
+    if len(patches) != 1:
+        raise PatchError(
+            f"Expected one GPU architecture case table, found {len(patches)}."
+        )
+    return patches[0].offset, patches[0].success_offset
+
+
+def apply_host_patches(data: bytearray) -> HostPatchResult:
+    sections = read_pe_sections(data)
+    exports = read_pe_exports(data, sections)
+    requirements = patch_minimum_architectures(data, sections, exports)
+    architecture_export = patch_exported_architecture(data, sections, exports)
+    lower_architecture = any(
+        patch.previous_value > TARGET_NGX_ARCH for patch in requirements
+    ) or (architecture_export is not None and architecture_export[1] > TARGET_NGX_ARCH)
+    metadata_offsets = patch_architecture_metadata(
+        data, lower_architecture=lower_architecture
+    )
+    ada_cases = patch_ada_cases(data)
+    return HostPatchResult(
+        requirements,
+        ada_cases,
+        architecture_export[0] if architecture_export is not None else None,
+        metadata_offsets,
+    )
+
+
+def repack_fatbin(
+    index: int,
+    source_blob: bytes,
+    tools: CudaTools,
+    root: Path,
+) -> tuple[bytes, TransformStats, int]:
+    # Preserve every source ELF image, normalize source PTX line endings, and
+    # add one compiled Ada image. Repack instead of editing compressed bytes.
+    work_dir = root / f"fatbin_{index:02d}"
+    work_dir.mkdir(parents=True, exist_ok=False)
+    source_path = work_dir / "input.fatbin"
+    source_path.write_bytes(source_blob)
+
+    images = extract_images(source_path, work_dir, tools.cuobjdump)
+    ptx_images = [image for image in images if image.kind == "ptx"]
+    if len(ptx_images) != 1:
+        raise PatchError(
+            f"Fatbin {index} has {len(ptx_images)} PTX images. Exactly one is required."
+        )
+    if any(
+        image.kind == "elf" and image.architecture == TARGET_ARCH for image in images
+    ):
+        raise PatchError(
+            f"Fatbin {index} already contains an sm_{TARGET_ARCH} ELF image."
+        )
+
+    source_ptx_image = ptx_images[0]
+    source_ptx_bytes = source_ptx_image.path.read_bytes()
+    try:
+        source_ptx = source_ptx_bytes.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise PatchError(f"Fatbin {index} PTX is not UTF-8 text.") from error
+    source_arch = parse_ptx_target(source_ptx)
+    if source_arch != source_ptx_image.architecture:
+        raise PatchError(
+            f"Fatbin {index} PTX target sm_{source_arch} does not match its image name."
+        )
+    if not any(
+        image.kind == "elf" and image.architecture == source_arch for image in images
+    ):
+        raise PatchError(f"Fatbin {index} has no sm_{source_arch} ELF image.")
+
+    transformed_ptx, stats = transform_ptx(source_ptx)
+    transformed_path = work_dir / "ada.ptx"
+    transformed_path.write_bytes(transformed_ptx.encode("utf-8"))
+    ada_cubin = work_dir / f"ada.sm_{TARGET_ARCH}.cubin"
+    run_tool(
+        [
+            tools.ptxas,
+            f"--gpu-name=sm_{TARGET_ARCH}",
+            transformed_path,
+            "--output-file",
+            ada_cubin,
+        ]
+    )
+    if not ada_cubin.is_file() or ada_cubin.stat().st_size == 0:
+        raise PatchError(
+            f"ptxas did not create the sm_{TARGET_ARCH} cubin for fatbin {index}."
+        )
+
+    deterministic_images: list[Image] = []
+    for image_number, image in enumerate(images):
+        if image.kind != "ptx":
+            deterministic_images.append(image)
+            continue
+        normalized_path = (
+            work_dir / f"source_{image_number}.sm_{image.architecture}.ptx"
+        )
+        normalized_path.write_bytes(normalize_crlf(image.path.read_bytes()))
+        deterministic_images.append(
+            Image(image.kind, image.architecture, normalized_path)
+        )
+
+    output_path = work_dir / "output.fatbin"
+    command: list[os.PathLike[str] | str] = [
+        tools.fatbinary,
+        "--64",
+        "--compress-all",
+        "--create",
+        output_path,
+        f"--image3=kind=elf,sm={TARGET_ARCH},file={ada_cubin}",
+    ]
+    for image in deterministic_images:
+        command.append(
+            f"--image3=kind={image.kind},sm={image.architecture},file={image.path}"
+        )
+    run_tool(command)
+    if not output_path.is_file():
+        raise PatchError(f"fatbinary did not create fatbin {index}.")
+    generated = preserve_record_flags(output_path.read_bytes(), source_blob)
+
+    # Round-trip through cuobjdump and compare payloads. The rebuilt container
+    # must keep each ELF and normalized PTX payload, plus the expected Ada image.
+    verification_path = work_dir / "verified.fatbin"
+    verification_path.write_bytes(generated)
+    verification_dir = work_dir / "verification"
+    verification_dir.mkdir()
+    verified_images = extract_images(
+        verification_path, verification_dir, tools.cuobjdump
+    )
+
+    expected: dict[tuple[str, int], list[bytes]] = {}
+    for image in images:
+        payload = image.path.read_bytes()
+        if image.kind == "ptx":
+            payload = normalize_crlf(payload)
+        expected.setdefault((image.kind, image.architecture), []).append(payload)
+    expected.setdefault(("elf", TARGET_ARCH), []).append(ada_cubin.read_bytes())
+
+    for image in verified_images:
+        key = (image.kind, image.architecture)
+        candidates = expected.get(key, [])
+        payload = image.path.read_bytes()
+        try:
+            candidates.remove(payload)
+        except ValueError as error:
+            raise PatchError(
+                f"Fatbin {index} changed or added an unexpected {image.kind} sm_"
+                f"{image.architecture} image."
+            ) from error
+    missing = [
+        f"{kind} sm_{architecture}"
+        for (kind, architecture), payloads in expected.items()
+        if payloads
+    ]
+    if missing:
+        raise PatchError(
+            f"Fatbin {index} lost these CUDA images: {', '.join(missing)}."
+        )
+    return generated, stats, ada_cubin.stat().st_size
+
+
+def path_exists(path: Path) -> bool:
+    """Return true for files, directories, and dangling symbolic links."""
+    return os.path.lexists(path)
+
+
+def stage_output(path: Path, data: bytes | bytearray, mode: int) -> Path:
+    temporary: Path | None = None
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            dir=path.parent,
+            delete=False,
+        ) as target:
+            temporary = Path(target.name)
+            target.write(data)
+            target.flush()
+            os.fsync(target.fileno())
+        temporary.chmod(mode)
+        return temporary
+    except BaseException as error:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+        if isinstance(error, OSError):
+            raise PatchError(
+                f"Cannot stage the output file for '{path}': {error}"
+            ) from error
+        raise
+
+
+def atomic_write(
+    path: Path,
+    data: bytes | bytearray,
+    mode: int,
+    *,
+    replace: bool = True,
+) -> None:
+    temporary = stage_output(path, data, mode)
+    try:
+        # Check again after staging because a full CUDA build can take time.
+        if not replace and path_exists(path):
+            raise PatchError(
+                f"Output file now exists: {path}. Use --force to replace it."
+            )
+        os.replace(temporary, path)
+    except OSError as error:
+        raise PatchError(f"Cannot write the output file '{path}': {error}") from error
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def replace_with_backup(
+    input_path: Path,
+    backup_path: Path,
+    data: bytes | bytearray,
+    mode: int,
+) -> None:
+    if path_exists(backup_path):
+        raise PatchError(f"Backup file exists: {backup_path}")
+    temporary = stage_output(input_path, data, mode)
+    moved = False
+    try:
+        # Check again after the staged DLL has been flushed to disk.
+        if path_exists(backup_path):
+            raise PatchError(f"Backup file now exists: {backup_path}")
+        input_path.rename(backup_path)
+        moved = True
+        os.replace(temporary, input_path)
+    except BaseException as error:
+        if moved and path_exists(backup_path) and not path_exists(input_path):
+            try:
+                backup_path.rename(input_path)
+                moved = False
+            except OSError as restore_error:
+                raise PatchError(
+                    f"Cannot install the patched DLL or restore the input. "
+                    f"The backup remains at '{backup_path}': {restore_error}"
+                ) from error
+        if isinstance(error, OSError):
+            raise PatchError(f"Cannot install the patched DLL: {error}") from error
+        raise
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def default_backup(input_path: Path) -> Path:
+    return input_path.with_name(f"{input_path.name}.bak")
+
+
+def plan_output(
+    input_path: Path,
+    requested_output: Path | None,
+    *,
+    force: bool,
+    dry_run: bool,
+) -> OutputPlan:
+    if requested_output is None:
+        backup_path = default_backup(input_path)
+        if path_exists(backup_path) and not dry_run:
+            raise PatchError(f"Backup file exists: {backup_path}")
+        return OutputPlan(input_path, backup_path)
+
+    output_path = requested_output.resolve()
+    if output_path == input_path:
+        raise PatchError("--output cannot name the input DLL.")
+    if path_exists(output_path) and not force and not dry_run:
+        raise PatchError(
+            f"Output file exists: {output_path}. Use --force to replace it."
+        )
+    return OutputPlan(output_path, None)
+
+
+def file_identity(info: os.stat_result) -> tuple[int, int, int, int, int]:
+    return (
+        info.st_dev,
+        info.st_ino,
+        info.st_size,
+        info.st_mtime_ns,
+        info.st_ctime_ns,
+    )
+
+
+def patch_file(
+    input_path: Path,
+    output_path: Path | None,
+    tools: CudaTools,
+    *,
+    force: bool,
+    dry_run: bool,
+    work_dir: Path | None,
+) -> None:
+    input_path = input_path.resolve()
+    if not input_path.is_file():
+        raise PatchError(f"Input file does not exist: {input_path}")
+    output_plan = plan_output(input_path, output_path, force=force, dry_run=dry_run)
+
+    # Build in memory and delay installation until all fatbins compile and
+    # verify. A failure therefore leaves the input DLL in place.
+    source_stat = input_path.stat()
+    source_bytes = input_path.read_bytes()
+    if file_identity(input_path.stat()) != file_identity(source_stat):
+        raise PatchError("The input DLL changed while it was being read.")
+    data = bytearray(source_bytes)
+    read_pe_sections(data)
+    locations = find_fatbins(data)
+    host = apply_host_patches(data)
+
+    print(f"Input:  {input_path}")
+    print(f"SHA-256: {sha256_bytes(source_bytes)}")
+    print(f"CUDA:   {cuda_version(tools.ptxas)}")
+    print(f"Fatbins: {len(locations)}")
+    requirements = ", ".join(
+        f"{patch.interface}@0x{patch.offset:x}" for patch in host.requirements
+    )
+    ada_cases = ", ".join(f"0x{patch.offset:x}" for patch in host.ada_cases)
+    print(f"Host:    requirements {requirements}; Ada cases {ada_cases}")
+    host_metadata = []
+    if host.architecture_export_offset is not None:
+        host_metadata.append(f"export@0x{host.architecture_export_offset:x}")
+    host_metadata.extend(
+        f"metadata@0x{offset:x}" for offset in host.architecture_metadata_offsets
+    )
+    if host_metadata:
+        print(f"Host:    architecture {', '.join(host_metadata)}")
+
+    temporary_context: tempfile.TemporaryDirectory[str] | None = None
+    if work_dir is None:
+        temporary_context = tempfile.TemporaryDirectory(prefix="dlssnr-ada-")
+        build_root = Path(temporary_context.name)
+    else:
+        build_root = work_dir.resolve()
+        if build_root.exists():
+            if not build_root.is_dir():
+                raise PatchError(f"Work path is not a directory: {build_root}")
+            if any(build_root.iterdir()):
+                raise PatchError(f"Work directory is not empty: {build_root}")
+        build_root.mkdir(parents=True, exist_ok=True)
+
+    totals = TransformStats()
+    try:
+        for index, location in enumerate(locations):
+            source_blob = bytes(data[location.offset : location.offset + location.size])
+            generated, stats, cubin_size = repack_fatbin(
+                index, source_blob, tools, build_root
+            )
+            if len(generated) > location.size:
+                raise PatchError(
+                    f"Fatbin {index} grew from {location.size} to {len(generated)} bytes. "
+                    "The DLL has no space for it."
+                )
+            # Each rebuilt fatbin must fit its original allocation. Padding
+            # the unused tail keeps later PE data at the same file offsets.
+            data[location.offset : location.offset + location.size] = generated + bytes(
+                location.size - len(generated)
+            )
+            for name, count in stats.values.items():
+                totals.add(name, count)
+            print(
+                f"[{index + 1:02d}/{len(locations):02d}] "
+                f"0x{location.offset:x}: {location.size} -> {len(generated)} bytes; "
+                f"sm_{TARGET_ARCH} cubin {cubin_size} bytes; {stats.summary()}"
+            )
+    finally:
+        if temporary_context is not None:
+            temporary_context.cleanup()
+
+    if data == source_bytes:
+        raise PatchError("No output bytes changed.")
+    # Update the PE checksum for loaders. This does not restore the
+    # invalidated Authenticode signature.
+    pe_checksum = update_pe_checksum(data)
+    print(f"Transforms: {totals.summary()}")
+    print(f"PE checksum: 0x{pe_checksum:08x}")
+    print(f"Output SHA-256: {sha256_bytes(data)}")
+    if dry_run:
+        print("Dry run complete. No output file was written.")
+        return
+
+    mode = stat.S_IMODE(source_stat.st_mode)
+    if output_plan.backup_path is None:
+        atomic_write(output_plan.output_path, data, mode, replace=force)
+    else:
+        if file_identity(input_path.stat()) != file_identity(source_stat):
+            raise PatchError("The input DLL changed during the CUDA build.")
+        replace_with_backup(input_path, output_plan.backup_path, data, mode)
+        print(f"Backup: {output_plan.backup_path}")
+    print(f"Output: {output_plan.output_path}")
+    print(
+        "Warning: The NVIDIA Authenticode signature is invalid because the DLL changed."
+    )
+    print(
+        "Warning: Anti-cheat or file-integrity systems can flag this DLL. "
+        "Do not use it with anti-cheat-protected software."
+    )
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Add sm_89 CUDA images and enable Ada in all detected NGX interfaces "
+            "in a user-supplied nvngx_dlssnr.dll."
+        )
+    )
+    parser.add_argument(
+        "input", type=Path, help="Path to the original nvngx_dlssnr.dll"
+    )
+    parser.add_argument(
+        "-o",
+        "--output",
+        type=Path,
+        help="Write to this path instead of backing up and replacing the input DLL",
+    )
+    parser.add_argument(
+        "--cuda-bin",
+        type=Path,
+        help="Directory that contains ptxas, fatbinary, and cuobjdump",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Replace an existing explicit output file",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Compile and validate all changes without writing the output",
+    )
+    parser.add_argument(
+        "--work-dir",
+        type=Path,
+        help="Keep extracted PTX and generated cubins in this empty directory",
+    )
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    try:
+        tools = find_cuda_tools(args.cuda_bin)
+        patch_file(
+            args.input,
+            args.output,
+            tools,
+            force=args.force,
+            dry_run=args.dry_run,
+            work_dir=args.work_dir,
+        )
+    except PatchError as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 1
+    except OSError as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        print("error: interrupted", file=sys.stderr)
+        return 130
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
