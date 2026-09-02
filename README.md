@@ -30,3 +30,13 @@ data.
 The patcher compiles and checks every change before it writes a file.
 It renames the original file to `nvngx_dlssnr.dll.bak` and installs
 the patched file under the original name.
+
+## Contributing
+
+Bug reports and pull requests are welcome. Read [CONTRIBUTING.md](CONTRIBUTING.md)
+before getting started.
+
+## License
+
+This project is licensed under the GNU General Public License v2.0. See
+[LICENSE](LICENSE) for the full terms.
