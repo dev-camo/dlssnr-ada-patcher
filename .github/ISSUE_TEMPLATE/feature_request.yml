@@ -1,0 +1,56 @@
+name: Feature request
+description: Propose a focused improvement to the patcher
+title: "[Feature]: "
+labels:
+  - enhancement
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Describe the problem before proposing an implementation. Open an issue before investing in support for a new binary layout or PTX instruction shape.
+
+        This project does not distribute NVIDIA/game files or help bypass anti-cheat and file-integrity protections.
+
+  - type: checkboxes
+    id: preliminary-checks
+    attributes:
+      label: Preliminary checks
+      options:
+        - label: I searched existing issues and pull requests for this proposal.
+          required: true
+        - label: This request does not require distributing proprietary files or bypassing a protection system.
+          required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or use case
+      description: What limitation are you encountering, and who would benefit from changing it?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed change
+      description: Describe the desired behavior rather than only an implementation.
+    validations:
+      required: true
+
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Supporting evidence
+      description: Describe relevant versions, errors, or binary/PTX characteristics without attaching proprietary artifacts.
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: What workarounds or other approaches have you considered?
+
+  - type: textarea
+    id: additional-context
+    attributes:
+      label: Additional context
+      description: Add any other non-proprietary context, mockups, or examples.

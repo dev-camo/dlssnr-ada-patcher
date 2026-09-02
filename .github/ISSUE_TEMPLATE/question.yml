@@ -1,0 +1,56 @@
+name: Question
+description: Ask for help using or understanding the patcher
+title: "[Question]: "
+labels:
+  - question
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please read the README and search existing issues first.
+
+        Do not attach or link to NVIDIA DLLs, model data, patched DLLs, extracted PTX, cubins, fatbins, or other game files. This project does not help bypass anti-cheat or file-integrity protections.
+
+  - type: checkboxes
+    id: preliminary-checks
+    attributes:
+      label: Preliminary checks
+      options:
+        - label: I read the README and searched existing issues.
+          required: true
+        - label: I have not attached or linked to proprietary or generated NVIDIA/game files.
+          required: true
+        - label: I am not asking for help bypassing anti-cheat or file-integrity protections.
+          required: true
+
+  - type: textarea
+    id: question
+    attributes:
+      label: Question
+      description: Explain what you are trying to do and where you are stuck.
+    validations:
+      required: true
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: If relevant, include your OS, Python version, CUDA Toolkit version, and patcher revision.
+      placeholder: |
+        OS: Windows 11 24H2
+        Python: 3.14.0
+        CUDA Toolkit: 13.3.x
+        Patcher revision: abc1234
+
+  - type: textarea
+    id: output
+    attributes:
+      label: Relevant output
+      description: Redact personal paths and unrelated system information. Do not include generated or proprietary file contents.
+      render: text
+
+  - type: textarea
+    id: attempted
+    attributes:
+      label: What have you tried?
+      description: List documentation, commands, or workarounds you already tried.

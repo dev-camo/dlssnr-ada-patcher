@@ -1,0 +1,138 @@
+name: Bug report
+description: Report a reproducible problem with the patcher
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a problem.
+
+        Do not attach or link to NVIDIA DLLs, model data, patched DLLs, extracted PTX, cubins, fatbins, or other game files. Redact personal paths from commands and logs. Do not use this project with anti-cheat-protected software.
+
+        For a potential security vulnerability, stop and follow the [security policy](https://github.com/dev-camo/dlssnr-ada-patcher/security/policy) instead.
+
+  - type: checkboxes
+    id: preliminary-checks
+    attributes:
+      label: Preliminary checks
+      options:
+        - label: I searched existing issues for the same problem.
+          required: true
+        - label: I am using the latest revision from the `main` branch.
+          required: true
+        - label: I have not attached or linked to proprietary or generated NVIDIA/game files.
+          required: true
+        - label: I am not asking for help bypassing anti-cheat or file-integrity protections.
+          required: true
+
+  - type: dropdown
+    id: problem-area
+    attributes:
+      label: Problem area
+      options:
+        - Command-line parsing or startup
+        - CUDA tool discovery or execution
+        - PE or fatbin validation
+        - PTX transformation or compilation
+        - Output, backup, or rollback behavior
+        - Patched DLL behavior
+        - Other
+    validations:
+      required: true
+
+  - type: input
+    id: operating-system
+    attributes:
+      label: Operating system
+      description: Include the edition and version.
+      placeholder: Windows 11 24H2
+    validations:
+      required: true
+
+  - type: input
+    id: python-version
+    attributes:
+      label: Python version
+      description: Paste the output of `python --version`.
+      placeholder: Python 3.14.0
+    validations:
+      required: true
+
+  - type: input
+    id: cuda-version
+    attributes:
+      label: CUDA Toolkit version
+      description: Paste the version reported by `ptxas --version`, or write "not reached" if the failure occurs first.
+      placeholder: CUDA compilation tools, release 13.3, V13.3.x
+    validations:
+      required: true
+
+  - type: input
+    id: input-source
+    attributes:
+      label: Input DLL source
+      description: Give only the game/application name and version. Do not provide the DLL itself or a download link.
+      placeholder: Game name and build number
+    validations:
+      required: true
+
+  - type: input
+    id: revision
+    attributes:
+      label: Patcher revision
+      description: Provide the Git commit hash you tested.
+      placeholder: abc1234
+    validations:
+      required: true
+
+  - type: input
+    id: input-hash
+    attributes:
+      label: Input DLL SHA-256
+      description: Provide only the original file's SHA-256 digest. Do not provide the file or a download link.
+      placeholder: 64-character hexadecimal digest
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: Describe the smallest reliable sequence that causes the problem.
+      placeholder: |
+        1. Run the patcher with ...
+        2. Observe ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: command
+    attributes:
+      label: Command
+      description: Replace personal or sensitive path components before pasting.
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: output
+    attributes:
+      label: Terminal output
+      description: Paste the complete relevant output after redacting personal paths and unrelated system information.
+      render: text
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected-behavior
+    attributes:
+      label: Expected behavior
+      description: What did you expect to happen instead?
+    validations:
+      required: true
+
+  - type: textarea
+    id: additional-context
+    attributes:
+      label: Additional context
+      description: Add any other non-proprietary details that may help reproduce the problem.
