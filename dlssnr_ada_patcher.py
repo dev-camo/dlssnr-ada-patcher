@@ -481,6 +481,16 @@ def normalize_crlf(data: bytes) -> bytes:
     return data.replace(b"\r\n", b"\n").replace(b"\r", b"\n").replace(b"\n", b"\r\n")
 
 
+def canonical_ptx(data: bytes) -> bytes:
+    """Return PTX text without carriage returns, for comparison only.
+
+    cuobjdump opens its output in text mode on Windows, so extracting a CRLF
+    payload writes every line ending back as CRCRLF. Dropping carriage returns
+    compares the PTX itself instead of how the toolchain spelled its newlines.
+    """
+    return data.replace(b"\r", b"")
+
+
 def parse_ptx_target(text: str) -> int:
     matches = re.findall(r"(?m)^\s*\.target\s+sm_(\d+)[a-z]?\b", text)
     if len(matches) != 1:
@@ -1188,7 +1198,7 @@ def repack_fatbin(
     for image in images:
         payload = image.path.read_bytes()
         if image.kind == "ptx":
-            payload = normalize_crlf(payload)
+            payload = canonical_ptx(payload)
         expected.setdefault((image.kind, image.architecture), []).append(payload)
     expected.setdefault(("elf", TARGET_ARCH), []).append(ada_cubin.read_bytes())
 
@@ -1196,6 +1206,8 @@ def repack_fatbin(
         key = (image.kind, image.architecture)
         candidates = expected.get(key, [])
         payload = image.path.read_bytes()
+        if image.kind == "ptx":
+            payload = canonical_ptx(payload)
         try:
             candidates.remove(payload)
         except ValueError as error:
