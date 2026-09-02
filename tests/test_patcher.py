@@ -1,3 +1,5 @@
+import os
+import stat
 import struct
 import tempfile
 import unittest
@@ -83,7 +85,12 @@ class OutputTests(unittest.TestCase):
 
             self.assertEqual(input_path.read_bytes(), b"patched")
             self.assertEqual(backup_path.read_bytes(), b"original")
-            self.assertEqual(input_path.stat().st_mode & 0o777, 0o640)
+            output_mode = stat.S_IMODE(input_path.stat().st_mode)
+            if os.name == "nt":
+                # Windows chmod only controls the read-only flag.
+                self.assertTrue(output_mode & stat.S_IWUSR)
+            else:
+                self.assertEqual(output_mode, 0o640)
 
     def test_replace_restores_input_after_install_error(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
