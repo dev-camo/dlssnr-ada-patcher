@@ -392,6 +392,15 @@ min.relu.s32 %r10, %r11, %r12;
             patcher.canonical_ptx(b".target sm_89\r\n"),
         )
 
+    def test_canonical_ptx_keeps_carriage_return_inside_token(self) -> None:
+        # A carriage return that is not part of a line ending is whitespace to
+        # the PTX parser and splits the token, so it must remain a difference.
+        self.assertNotEqual(
+            patcher.canonical_ptx(b".target sm_1\r20\n"),
+            patcher.canonical_ptx(b".target sm_120\n"),
+        )
+        self.assertEqual(patcher.canonical_ptx(b"a\rb\n"), b"a\rb\n")
+
 
 class HostCaseTests(unittest.TestCase):
     @staticmethod
