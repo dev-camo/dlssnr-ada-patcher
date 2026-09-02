@@ -376,6 +376,31 @@ min.relu.s32 %r10, %r11, %r12;
         with self.assertRaisesRegex(patcher.PatchError, "bulk-copy size 1536"):
             patcher.transform_ptx(source)
 
+    def test_canonical_ptx_ignores_text_mode_expansion(self) -> None:
+        source = b".version 9.4\r\n.target sm_120\r\n.address_size 64\r\n"
+        # cuobjdump opens its output in text mode on Windows, so extracting an
+        # already-CRLF payload expands every LF again and yields CRCRLF.
+        extracted = source.replace(b"\n", b"\r\n")
+        self.assertNotEqual(source, extracted)
+        self.assertEqual(
+            patcher.canonical_ptx(source), patcher.canonical_ptx(extracted)
+        )
+
+    def test_canonical_ptx_keeps_payload_differences(self) -> None:
+        self.assertNotEqual(
+            patcher.canonical_ptx(b".target sm_120\r\n"),
+            patcher.canonical_ptx(b".target sm_89\r\n"),
+        )
+
+    def test_canonical_ptx_keeps_carriage_return_inside_token(self) -> None:
+        # A carriage return that is not part of a line ending is whitespace to
+        # the PTX parser and splits the token, so it must remain a difference.
+        self.assertNotEqual(
+            patcher.canonical_ptx(b".target sm_1\r20\n"),
+            patcher.canonical_ptx(b".target sm_120\n"),
+        )
+        self.assertEqual(patcher.canonical_ptx(b"a\rb\n"), b"a\rb\n")
+
 
 class HostCaseTests(unittest.TestCase):
     @staticmethod
