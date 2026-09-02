@@ -43,6 +43,14 @@ class PeSection:
 
 
 @dataclass(frozen=True)
+class AuthenticodeRemoval:
+    offset: int
+    size: int
+    certificate_count: int
+    trailing_data_size: int
+
+
+@dataclass(frozen=True)
 class FatbinLocation:
     offset: int
     header_size: int
@@ -157,6 +165,87 @@ def read_pe_sections(data: bytes | bytearray) -> list[PeSection]:
             raise PatchError(f"PE section {index} extends past the input file.")
         sections.append(PeSection(virtual_address, virtual_size, raw_offset, raw_size))
     return sections
+
+
+def strip_authenticode(data: bytearray) -> AuthenticodeRemoval | None:
+    """Remove the PE certificate table and preserve all other file data."""
+    sections = read_pe_sections(data)
+    pe_offset = pe_header_offset(data)
+    section_count = struct.unpack_from("<H", data, pe_offset + 6)[0]
+    optional_size = struct.unpack_from("<H", data, pe_offset + 20)[0]
+    optional_offset = pe_offset + 24
+
+    # PE32+ stores NumberOfRvaAndSizes at +108 and its data directories at
+    # +112. The security directory is entry 4. Its first value is a file
+    # offset, unlike the RVAs in the other data-directory entries.
+    directory_count_offset = optional_offset + 108
+    directory_offset = optional_offset + 112 + 4 * 8
+    optional_end = optional_offset + optional_size
+    if directory_count_offset + 4 > optional_end:
+        raise PatchError("The input PE optional header has no data directories.")
+    directory_count = struct.unpack_from("<I", data, directory_count_offset)[0]
+    if directory_count <= 4:
+        return None
+    if directory_offset + 8 > optional_end:
+        raise PatchError("The PE security directory is truncated.")
+
+    certificate_offset, certificate_size = struct.unpack_from(
+        "<II", data, directory_offset
+    )
+    if not certificate_offset and not certificate_size:
+        return None
+    if not certificate_offset or not certificate_size:
+        raise PatchError("The PE security directory is invalid.")
+    if certificate_offset & 7:
+        raise PatchError("The PE certificate table is not 8-byte aligned.")
+    if (
+        certificate_offset > len(data)
+        or certificate_size > len(data) - certificate_offset
+    ):
+        raise PatchError("The PE certificate table extends past the input file.")
+
+    # A certificate table is outside the mapped PE image. Reject a directory
+    # that overlaps headers or section data so that removal cannot shift them.
+    section_table_end = optional_end + section_count * 40
+    size_of_headers = struct.unpack_from("<I", data, optional_offset + 60)[0]
+    image_data_end = max(
+        [
+            section_table_end,
+            size_of_headers,
+            *(
+                section.raw_offset + section.raw_size
+                for section in sections
+                if section.raw_size
+            ),
+        ]
+    )
+    if certificate_offset < image_data_end:
+        raise PatchError("The PE certificate table overlaps PE image data.")
+
+    certificate_end = certificate_offset + certificate_size
+    certificate_count = 0
+    position = certificate_offset
+    while position < certificate_end:
+        if certificate_end - position < 8:
+            raise PatchError("The PE certificate table has a truncated entry header.")
+        entry_size = struct.unpack_from("<I", data, position)[0]
+        if entry_size < 8:
+            raise PatchError("The PE certificate table has an invalid entry length.")
+        aligned_size = (entry_size + 7) & ~7
+        if aligned_size > certificate_end - position:
+            raise PatchError("A PE certificate entry extends past its table.")
+        position += aligned_size
+        certificate_count += 1
+
+    trailing_data_size = len(data) - certificate_end
+    struct.pack_into("<II", data, directory_offset, 0, 0)
+    del data[certificate_offset:certificate_end]
+    return AuthenticodeRemoval(
+        certificate_offset,
+        certificate_size,
+        certificate_count,
+        trailing_data_size,
+    )
 
 
 def calculate_pe_checksum(data: bytes | bytearray) -> int:
@@ -1367,7 +1456,7 @@ def patch_file(
     if file_identity(input_path.stat()) != file_identity(source_stat):
         raise PatchError("The input DLL changed while it was being read.")
     data = bytearray(source_bytes)
-    read_pe_sections(data)
+    authenticode = strip_authenticode(data)
     locations = find_fatbins(data)
     host = apply_host_patches(data)
 
@@ -1375,6 +1464,19 @@ def patch_file(
     print(f"SHA-256: {sha256_bytes(source_bytes)}")
     print(f"CUDA:   {cuda_version(tools.ptxas)}")
     print(f"Fatbins: {len(locations)}")
+    if authenticode is None:
+        print("Authenticode: no certificate table was present")
+    else:
+        entry_label = "entry" if authenticode.certificate_count == 1 else "entries"
+        print(
+            f"Authenticode: removed {authenticode.size} bytes "
+            f"({authenticode.certificate_count} {entry_label})"
+        )
+        if authenticode.trailing_data_size:
+            print(
+                "Overlay: preserved "
+                f"{authenticode.trailing_data_size} bytes after the certificate table"
+            )
     requirements = ", ".join(
         f"{patch.interface}@0x{patch.offset:x}" for patch in host.requirements
     )
@@ -1432,8 +1534,8 @@ def patch_file(
 
     if data == source_bytes:
         raise PatchError("No output bytes changed.")
-    # Update the PE checksum for loaders. This does not restore the
-    # invalidated Authenticode signature.
+    # Update the PE checksum after all file changes, including certificate
+    # removal.
     pe_checksum = update_pe_checksum(data)
     print(f"Transforms: {totals.summary()}")
     print(f"PE checksum: 0x{pe_checksum:08x}")
@@ -1451,9 +1553,6 @@ def patch_file(
         replace_with_backup(input_path, output_plan.backup_path, data, mode)
         print(f"Backup: {output_plan.backup_path}")
     print(f"Output: {output_plan.output_path}")
-    print(
-        "Warning: The NVIDIA Authenticode signature is invalid because the DLL changed."
-    )
     print(
         "Warning: Anti-cheat or file-integrity systems can flag this DLL. "
         "Do not use it with anti-cheat-protected software."
