@@ -482,14 +482,7 @@ def normalize_crlf(data: bytes) -> bytes:
 
 
 def canonical_ptx(data: bytes) -> bytes:
-    """Return PTX text with line endings reduced to LF, for comparison only.
-
-    cuobjdump opens its output in text mode on Windows, so extracting a CRLF
-    payload writes every line ending back as CRCRLF. Only carriage returns that
-    immediately precede a line feed are dropped: CRLF and CRCRLF compare equal,
-    while a carriage return anywhere else still separates tokens and therefore
-    still counts as a payload difference.
-    """
+    """Normalize PTX line endings for comparison."""
     return re.sub(rb"\r+(?=\n)", b"", data)
 
 

@@ -378,8 +378,6 @@ min.relu.s32 %r10, %r11, %r12;
 
     def test_canonical_ptx_ignores_text_mode_expansion(self) -> None:
         source = b".version 9.4\r\n.target sm_120\r\n.address_size 64\r\n"
-        # cuobjdump opens its output in text mode on Windows, so extracting an
-        # already-CRLF payload expands every LF again and yields CRCRLF.
         extracted = source.replace(b"\n", b"\r\n")
         self.assertNotEqual(source, extracted)
         self.assertEqual(
@@ -393,8 +391,6 @@ min.relu.s32 %r10, %r11, %r12;
         )
 
     def test_canonical_ptx_keeps_carriage_return_inside_token(self) -> None:
-        # A carriage return that is not part of a line ending is whitespace to
-        # the PTX parser and splits the token, so it must remain a difference.
         self.assertNotEqual(
             patcher.canonical_ptx(b".target sm_1\r20\n"),
             patcher.canonical_ptx(b".target sm_120\n"),
