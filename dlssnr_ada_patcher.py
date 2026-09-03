@@ -643,13 +643,15 @@ def previous_literal_assignment(
     return int(value)
 
 
+PTX_PREDICATE = r"(?:%p\d+|[A-Za-z_][\w$]*)"
+
 FP8_DOWN_PATTERN = re.compile(
-    r"(?P<guard>@!?%p\d+\s+)?"
+    rf"(?P<guard>@!?{PTX_PREDICATE}\s+)?"
     r"cvt\.rn\.satfinite\.e4m3x2\.f16x2\s+"
     r"(?P<destination>%rs\d+),\s*(?P<source>%r\d+)\s*;"
 )
 FP8_UP_PATTERN = re.compile(
-    r"(?P<guard>@!?%p\d+\s+)?"
+    rf"(?P<guard>@!?{PTX_PREDICATE}\s+)?"
     r"cvt\.rn\.f16x2\.e4m3x2\s+"
     r"(?P<destination>%r\d+),\s*(?P<source>%rs\d+)\s*;"
 )
@@ -658,7 +660,7 @@ FP8_PACK_PATTERN = re.compile(
     r"\{\s*(?P<low>%rs\d+),\s*(?P<high>%rs\d+)\s*\}\s*;"
 )
 FP8_MMA_PATTERN = re.compile(
-    r"(?P<guard>@!?%p\d+\s+)?"
+    rf"(?P<guard>@!?{PTX_PREDICATE}\s+)?"
     r"mma\.sync\.aligned\.m16n8k32\.row\.col\.f16\.e4m3\.e4m3\.f16\s*"
     r"\{\s*(?P<d0>%r\d+),\s*(?P<d1>%r\d+)\s*\}\s*,\s*"
     r"\{\s*(?P<a0>%r\d+),\s*(?P<a1>%r\d+),\s*"
@@ -1076,7 +1078,7 @@ def lower_fp8_operations(text: str, stats: TransformStats) -> str:
 
 F16_MMA_REGISTER = r"(?:%r\d+|dlssnr_fp16_\d+_[01])"
 F16_MMA_PATTERN = re.compile(
-    r"(?P<guard>@!?%p\d+\s+)?"
+    rf"(?P<guard>@!?{PTX_PREDICATE}\s+)?"
     r"mma\.sync\.aligned\.m16n8k16\.row\.col\.f16\.f16\.f16\.f16\s*"
     r"\{\s*(?P<d0>%r\d+),\s*(?P<d1>%r\d+)\s*\}\s*,\s*"
     rf"\{{\s*(?P<a0>{F16_MMA_REGISTER}),\s*"
@@ -1088,13 +1090,13 @@ F16_MMA_PATTERN = re.compile(
     r"\{\s*(?P<c0>%r\d+),\s*(?P<c1>%r\d+)\s*\}\s*;"
 )
 F16_MIN_MAX_PATTERN = re.compile(
-    r"(?P<guard>@!?%p\d+\s+)?"
+    rf"(?P<guard>@!?{PTX_PREDICATE}\s+)?"
     r"(?P<operation>min|max)\.f16x2\s+"
     r"(?P<destination>%r\d+),\s*(?P<first>%r\d+),\s*"
     r"(?P<second>%r\d+)\s*;"
 )
 SIMPLE_ASYNC_COPY_PATTERN = re.compile(
-    r"(?P<guard>@!?%p\d+\s+)?"
+    rf"(?P<guard>@!?{PTX_PREDICATE}\s+)?"
     r"cp\.async\.(?P<cache>ca|cg)\.shared\.global\s+"
     r"\[(?P<destination>%r\d+)\],\s*\[(?P<source>%rd\d+)\],\s*"
     r"(?P<size>4|8|16)\s*;"
@@ -1352,8 +1354,9 @@ def transform_ptx(
     # Pre-Blackwell targets have no equivalent for the newer warp bulk-copy
     # instruction. Accept only ordered elect/copy/expect groups whose barrier
     # operands match.
-    predicate = r"(?:%p\d+|[A-Za-z_][\w$]*)"
-    elect_pattern = re.compile(rf"elect\.sync\s+_\|({predicate}),\s*%r\d+\s*;")
+    elect_pattern = re.compile(
+        rf"elect\.sync\s+_\|({PTX_PREDICATE}),\s*%r\d+\s*;"
+    )
     bulk_pattern = re.compile(
         r"cp\.async\.bulk\.shared::cta\.global\.mbarrier::complete_tx::bytes\s+"
         r"\[(%r\d+)\],\s*\[(%rd\d+)\],\s*(%r\d+),\s*\[(%r\d+)\]\s*;"
@@ -1405,7 +1408,7 @@ def transform_ptx(
     )
     wait_pattern = re.compile(
         rf"mbarrier\.try_wait\.shared::cta\.b64\s+"
-        rf"({predicate}),\s*\[(%r\d+)\],\s*(%rd\d+)\s*;"
+        rf"({PTX_PREDICATE}),\s*\[(%r\d+)\],\s*(%rd\d+)\s*;"
     )
     arrive_matches = list(arrive_pattern.finditer(output))
     wait_matches = list(wait_pattern.finditer(output))

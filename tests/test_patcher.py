@@ -673,12 +673,16 @@ mbarrier.try_wait.shared::cta.b64 %p1, [%r18], %rd2;
             patcher.transform_ptx(source, patcher.TURING)
 
     def test_reject_predicated_turing_matrix_operation(self) -> None:
-        source = self.TURING_SOURCE.replace(
-            "mma.sync.aligned.m16n8k16",
-            "@%p2 mma.sync.aligned.m16n8k16",
-        )
-        with self.assertRaisesRegex(patcher.PatchError, "predicated FP16 matrix"):
-            patcher.transform_ptx(source, patcher.TURING)
+        for guard in ("@%p2", "@!P2"):
+            with self.subTest(guard=guard):
+                source = self.TURING_SOURCE.replace(
+                    "mma.sync.aligned.m16n8k16",
+                    f"{guard} mma.sync.aligned.m16n8k16",
+                )
+                with self.assertRaisesRegex(
+                    patcher.PatchError, "predicated FP16 matrix"
+                ):
+                    patcher.transform_ptx(source, patcher.TURING)
 
     def test_reject_unsupported_turing_half_operation(self) -> None:
         source = self.TURING_SOURCE.replace("min.f16x2", "min.f16")
