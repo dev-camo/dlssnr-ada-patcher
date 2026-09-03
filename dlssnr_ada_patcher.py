@@ -1388,8 +1388,9 @@ def transform_ptx(
         r"\[(%r\d+)\],\s*\[(%rd\d+)\],\s*(%r\d+),\s*\[(%r\d+)\]\s*;"
     )
     expect_pattern = re.compile(
+        rf"(?P<guard>@!?{PTX_PREDICATE}\s+)?"
         r"mbarrier\.expect_tx(?:\.[A-Za-z0-9_:]+)*\s+"
-        r"\[(%r\d+)\],\s*(%r\d+)\s*;"
+        r"\[(?P<barrier>%r\d+)\],\s*(?P<size>%r\d+)\s*;"
     )
     elect_matches = list(elect_pattern.finditer(output))
     bulk_matches = list(bulk_pattern.finditer(output))
@@ -1403,6 +1404,8 @@ def transform_ptx(
         raise PatchError("A bulk-copy operation has an unsupported form.")
     if len(expect_matches) != len(generic_expects):
         raise PatchError("A transaction expectation has an unsupported form.")
+    if any(match.group("guard") for match in expect_matches):
+        raise PatchError("A predicated transaction expectation is unsupported.")
 
     ordered_copy_operations = sorted(
         [(match.start(), "elect") for match in elect_matches]
@@ -1420,7 +1423,10 @@ def transform_ptx(
     ):
         if elect.group(1) not in output[elect.end() : bulk.start()]:
             raise PatchError("An elected predicate does not control its bulk copy.")
-        if (bulk.group(4), bulk.group(3)) != (expect.group(1), expect.group(2)):
+        if (bulk.group(4), bulk.group(3)) != (
+            expect.group("barrier"),
+            expect.group("size"),
+        ):
             raise PatchError(
                 "A bulk copy and its transaction expectation do not match."
             )

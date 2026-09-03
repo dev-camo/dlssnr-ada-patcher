@@ -799,6 +799,16 @@ mbarrier.try_wait.shared::cta.b64 %p1, [%r18], %rd2;
         with self.assertRaisesRegex(patcher.PatchError, "do not match"):
             patcher.transform_ptx(source)
 
+    def test_reject_predicated_transaction_expectation(self) -> None:
+        source = self.SOURCE.replace(
+            "mbarrier.expect_tx.relaxed.cta.shared::cta.b64",
+            "@P1 mbarrier.expect_tx.relaxed.cta.shared::cta.b64",
+        )
+        with self.assertRaisesRegex(
+            patcher.PatchError, "predicated transaction expectation"
+        ):
+            patcher.transform_ptx(source)
+
     def test_reject_mismatched_barrier_state(self) -> None:
         source = self.SOURCE.replace(
             "mbarrier.try_wait.shared::cta.b64 P_OUT, [%r2], %rd2;",
