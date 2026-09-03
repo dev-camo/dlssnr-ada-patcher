@@ -657,6 +657,13 @@ mbarrier.try_wait.shared::cta.b64 %p1, [%r18], %rd2;
                 with self.assertRaisesRegex(patcher.PatchError, message):
                     patcher.transform_ptx(source, patcher.AMPERE)
 
+    def test_reject_predicated_fp8_pack(self) -> None:
+        source = self.FP8_SOURCE.replace(
+            "mov.b32 %r20", "@P1 mov.b32 %r20"
+        )
+        with self.assertRaisesRegex(patcher.PatchError, "predicated FP8 pack"):
+            patcher.transform_ptx(source, patcher.AMPERE)
+
     def test_transform_turing_operations(self) -> None:
         output, stats = patcher.transform_ptx(self.TURING_SOURCE, patcher.TURING)
 

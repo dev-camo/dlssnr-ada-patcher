@@ -656,6 +656,7 @@ FP8_UP_PATTERN = re.compile(
     r"(?P<destination>%r\d+),\s*(?P<source>%rs\d+)\s*;"
 )
 FP8_PACK_PATTERN = re.compile(
+    rf"(?P<guard>@!?{PTX_PREDICATE}\s+)?"
     r"mov\.b32\s+(?P<destination>%r\d+),\s*"
     r"\{\s*(?P<low>%rs\d+),\s*(?P<high>%rs\d+)\s*\}\s*;"
 )
@@ -1071,6 +1072,8 @@ def lower_fp8_operations(text: str, stats: TransformStats) -> str:
         raise PatchError("A predicated FP16-to-FP8 conversion is unsupported.")
     if any(match.group("guard") for match in FP8_UP_PATTERN.finditer(text)):
         raise PatchError("A predicated FP8-to-FP16 conversion is unsupported.")
+    if any(match.group("guard") for match in FP8_PACK_PATTERN.finditer(text)):
+        raise PatchError("A predicated FP8 pack operation is unsupported.")
     text, mma_count = lower_fp8_mma(text)
     stats.add("fp8_mma", mma_count)
     return lower_fp8_conversions(text, stats)
