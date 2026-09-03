@@ -1088,11 +1088,13 @@ F16_MMA_PATTERN = re.compile(
     r"\{\s*(?P<c0>%r\d+),\s*(?P<c1>%r\d+)\s*\}\s*;"
 )
 F16_MIN_MAX_PATTERN = re.compile(
+    r"(?P<guard>@!?%p\d+\s+)?"
     r"(?P<operation>min|max)\.f16x2\s+"
     r"(?P<destination>%r\d+),\s*(?P<first>%r\d+),\s*"
     r"(?P<second>%r\d+)\s*;"
 )
 SIMPLE_ASYNC_COPY_PATTERN = re.compile(
+    r"(?P<guard>@!?%p\d+\s+)?"
     r"cp\.async\.(?P<cache>ca|cg)\.shared\.global\s+"
     r"\[(?P<destination>%r\d+)\],\s*\[(?P<source>%rd\d+)\],\s*"
     r"(?P<size>4|8|16)\s*;"
@@ -1149,9 +1151,13 @@ def lower_turing_mma(text: str, stats: TransformStats) -> str:
 
 def lower_turing_half_min_max(text: str, stats: TransformStats) -> str:
     generic_count = len(re.findall(r"\b(?:min|max)\.f16(?:x2)?\b", text))
-    exact_count = len(F16_MIN_MAX_PATTERN.findall(text))
-    if exact_count != generic_count:
+    matches = list(F16_MIN_MAX_PATTERN.finditer(text))
+    if len(matches) != generic_count:
         raise PatchError("A half-precision minimum or maximum has an unsupported form.")
+    if any(match.group("guard") for match in matches):
+        raise PatchError(
+            "A predicated half-precision minimum or maximum is unsupported for Turing."
+        )
 
     def replace(match: re.Match[str]) -> str:
         operation = match.group("operation")
@@ -1200,11 +1206,14 @@ def lower_turing_half_min_max(text: str, stats: TransformStats) -> str:
 
 def lower_turing_async_copies(text: str, stats: TransformStats) -> str:
     generic_count = len(re.findall(r"\bcp\.async(?:\.[^;\n]*)?\s*[^;\n]*;", text))
-    copy_count = len(SIMPLE_ASYNC_COPY_PATTERN.findall(text))
+    copy_matches = list(SIMPLE_ASYNC_COPY_PATTERN.finditer(text))
+    copy_count = len(copy_matches)
     commit_count = len(ASYNC_COMMIT_PATTERN.findall(text))
     wait_count = len(ASYNC_WAIT_PATTERN.findall(text))
     if copy_count + commit_count + wait_count != generic_count:
         raise PatchError("An asynchronous copy has an unsupported form for Turing.")
+    if any(match.group("guard") for match in copy_matches):
+        raise PatchError("A predicated asynchronous copy is unsupported for Turing.")
     if commit_count != wait_count:
         raise PatchError("Turing asynchronous copy groups are not paired.")
 

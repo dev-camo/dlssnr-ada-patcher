@@ -685,12 +685,25 @@ mbarrier.try_wait.shared::cta.b64 %p1, [%r18], %rd2;
         with self.assertRaisesRegex(patcher.PatchError, "minimum or maximum"):
             patcher.transform_ptx(source, patcher.TURING)
 
+    def test_reject_predicated_turing_half_operation(self) -> None:
+        source = self.TURING_SOURCE.replace("min.f16x2", "@%p2 min.f16x2")
+        with self.assertRaisesRegex(patcher.PatchError, "predicated half-precision"):
+            patcher.transform_ptx(source, patcher.TURING)
+
     def test_reject_unsupported_turing_async_copy(self) -> None:
         source = self.TURING_SOURCE.replace(
             "shared.global [%r17], [%rd1], 4",
             "shared.global [%r17], [%rd1], 12",
         )
         with self.assertRaisesRegex(patcher.PatchError, "asynchronous copy"):
+            patcher.transform_ptx(source, patcher.TURING)
+
+    def test_reject_predicated_turing_async_copy(self) -> None:
+        source = self.TURING_SOURCE.replace(
+            "cp.async.ca.shared.global",
+            "@!%p2 cp.async.ca.shared.global",
+        )
+        with self.assertRaisesRegex(patcher.PatchError, "predicated asynchronous copy"):
             patcher.transform_ptx(source, patcher.TURING)
 
     def test_reject_unsupported_turing_mbarrier(self) -> None:
