@@ -7,7 +7,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-import dlssnr_ada_patcher as patcher
+import dlssnr_patcher as patcher
 
 
 def make_record(kind: int, flags: int, payload: bytes = b"data") -> bytes:
@@ -148,7 +148,7 @@ class OutputTests(unittest.TestCase):
 
             with (
                 mock.patch(
-                    "dlssnr_ada_patcher.os.replace", side_effect=OSError("test failure")
+                    "dlssnr_patcher.os.replace", side_effect=OSError("test failure")
                 ),
                 self.assertRaisesRegex(patcher.PatchError, "Cannot install"),
             ):
@@ -165,7 +165,7 @@ class OutputTests(unittest.TestCase):
 
             with (
                 mock.patch(
-                    "dlssnr_ada_patcher.os.replace", side_effect=KeyboardInterrupt
+                    "dlssnr_patcher.os.replace", side_effect=KeyboardInterrupt
                 ),
                 self.assertRaises(KeyboardInterrupt),
             ):
@@ -186,7 +186,7 @@ class OutputTests(unittest.TestCase):
 
             with (
                 mock.patch(
-                    "dlssnr_ada_patcher.stage_output", side_effect=stage_then_create
+                    "dlssnr_patcher.stage_output", side_effect=stage_then_create
                 ),
                 self.assertRaisesRegex(patcher.PatchError, "now exists"),
             ):

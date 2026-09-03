@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Add selected RTX CUDA images to a user-supplied DLSS Neural Rendering DLL."""
+"""DLSS Neural Rendering Patcher command-line implementation."""
 
 from __future__ import annotations
 

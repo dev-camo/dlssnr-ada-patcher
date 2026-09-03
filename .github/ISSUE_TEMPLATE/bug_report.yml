@@ -11,7 +11,7 @@ body:
 
         Do not attach or link to NVIDIA DLLs, model data, patched DLLs, extracted PTX, cubins, fatbins, or other game files. Redact personal paths from commands and logs. Do not use this project with anti-cheat-protected software.
 
-        For a potential security vulnerability, stop and follow the [security policy](https://github.com/dev-camo/dlssnr-ada-patcher/security/policy) instead.
+        For a potential security vulnerability, stop and follow the [security policy](https://github.com/dev-camo/dlssnr-patcher/security/policy) instead.
 
   - type: checkboxes
     id: preliminary-checks

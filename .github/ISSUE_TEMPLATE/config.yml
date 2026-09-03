@@ -1,5 +1,5 @@
 blank_issues_enabled: true
 contact_links:
   - name: Security vulnerability
-    url: https://github.com/dev-camo/dlssnr-ada-patcher/security/policy
+    url: https://github.com/dev-camo/dlssnr-patcher/security/policy
     about: Read the security policy before reporting a vulnerability.

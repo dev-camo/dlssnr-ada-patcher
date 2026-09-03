@@ -1,6 +1,6 @@
 # Contributing
 
-Thanks for helping improve DLSS Neural Rendering RTX Patcher. Bug reports,
+Thanks for helping improve DLSS Neural Rendering Patcher. Bug reports,
 documentation fixes, tests, and focused code changes are welcome.
 
 ## Before you start
@@ -40,7 +40,7 @@ python -m unittest discover -s tests -v
 Smoke-test the command-line interface with:
 
 ```text
-python dlssnr_ada_patcher.py --help
+python dlssnr_patcher.py --help
 ```
 
 Run a focused test while iterating, for example:

@@ -1,4 +1,4 @@
-# DLSS Neural Rendering RTX Patcher
+# DLSS Neural Rendering Patcher
 
 Patch a user-supplied `nvngx_dlssnr.dll` for NVIDIA GeForce RTX 20, 30, 40,
 and 50 Series GPUs.
@@ -24,7 +24,7 @@ their directory with `--cuda-bin`.
 3. Run:
 
    ```text
-   python dlssnr_ada_patcher.py "C:\path\to\nvngx_dlssnr.dll"
+   python dlssnr_patcher.py "C:\path\to\nvngx_dlssnr.dll"
    ```
 
 With no architecture flags, the patcher includes every supported generation:
@@ -39,7 +39,7 @@ With no architecture flags, the patcher includes every supported generation:
 Use one or more flags to build only their union. For example:
 
 ```text
-python dlssnr_ada_patcher.py --turing --ampere "C:\path\to\nvngx_dlssnr.dll"
+python dlssnr_patcher.py --turing --ampere "C:\path\to\nvngx_dlssnr.dll"
 ```
 
 By default, the original becomes `nvngx_dlssnr.dll.bak` and the patched file
@@ -50,7 +50,7 @@ takes its place. Use `--output patched.dll` to keep the input unchanged, or
 > signature and can trigger anti-cheat or file-integrity systems. Do not use a
 > patched DLL with online, competitive, or anti-cheat-protected software.
 
-Run `python dlssnr_ada_patcher.py --help` for every option.
+Run `python dlssnr_patcher.py --help` for every option.
 
 ## Contributing
 
