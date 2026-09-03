@@ -473,6 +473,25 @@ cvt.rn.f16x2.e4m3x2 %r30, %rs9;
 mma.sync.aligned.m16n8k32.row.col.f16.e4m3.e4m3.f16
     {%r40, %r41}, {%r20, %r21, %r22, %r23}, {%r24, %r25}, {%r26, %r27};
 """
+    TURING_SOURCE = """
+.version 9.4
+.target sm_120
+.address_size 64
+mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16
+    {%r1, %r2}, {%r3, %r4, %r5, %r6}, {%r7, %r8}, {%r9, %r10};
+min.f16x2 %r11, %r12, %r13;
+max.f16x2 %r14, %r15, %r16;
+cp.async.ca.shared.global [%r17], [%rd1], 4;
+cp.async.commit_group;
+cp.async.wait_group 0;
+mov.u32 %r21, %ntid.x;
+mov.u32 %r22, %ntid.y;
+mul.lo.s32 %r19, %r21, %r22;
+mbarrier.init.shared.b64 [%r18], %r19;
+mov.b32 %r20, 1;
+mbarrier.arrive.shared::cta.b64 %rd2, [%r18], %r20;
+mbarrier.try_wait.shared::cta.b64 %p1, [%r18], %rd2;
+"""
 
     def test_transform_supported_operations(self) -> None:
         output, stats = patcher.transform_ptx(self.SOURCE)
@@ -524,6 +543,60 @@ mma.sync.aligned.m16n8k32.row.col.f16.e4m3.e4m3.f16
         )
         with self.assertRaisesRegex(patcher.PatchError, "FP8-to-FP16 conversion"):
             patcher.transform_ptx(source, patcher.AMPERE)
+
+    def test_transform_turing_operations(self) -> None:
+        output, stats = patcher.transform_ptx(self.TURING_SOURCE, patcher.TURING)
+
+        self.assertNotIn("m16n8k16", output)
+        self.assertEqual(output.count("m16n8k8.row.col.f16.f16.f16.f16"), 2)
+        self.assertNotIn("min.f16", output)
+        self.assertNotIn("max.f16", output)
+        self.assertIn("min.f32", output)
+        self.assertIn("max.f32", output)
+        self.assertIn("ld.global.ca.b32", output)
+        self.assertIn("st.shared.b32", output)
+        self.assertNotIn("cp.async", output)
+        self.assertNotIn("mbarrier", output)
+        self.assertIn("bar.sync 0;", output)
+        self.assertEqual(stats.values["mma_k16"], 1)
+        self.assertEqual(stats.values["half_min"], 1)
+        self.assertEqual(stats.values["half_max"], 1)
+        self.assertEqual(stats.values["async_copy"], 1)
+        self.assertEqual(stats.values["barrier_sync"], 1)
+
+    def test_transform_turing_bulk_copy(self) -> None:
+        output, _stats = patcher.transform_ptx(self.SOURCE, patcher.TURING)
+        self.assertIn("ld.global.cg.v4.b32", output)
+        self.assertIn("st.shared.v4.b32", output)
+        self.assertNotIn("cp.async", output)
+        self.assertNotIn("mbarrier", output)
+
+    def test_reject_unsupported_turing_matrix_shape(self) -> None:
+        source = self.TURING_SOURCE.replace(
+            ".m16n8k16.row.col", ".m16n8k16.col.row"
+        )
+        with self.assertRaisesRegex(patcher.PatchError, "FP16 matrix operation"):
+            patcher.transform_ptx(source, patcher.TURING)
+
+    def test_reject_unsupported_turing_half_operation(self) -> None:
+        source = self.TURING_SOURCE.replace("min.f16x2", "min.f16")
+        with self.assertRaisesRegex(patcher.PatchError, "minimum or maximum"):
+            patcher.transform_ptx(source, patcher.TURING)
+
+    def test_reject_unsupported_turing_async_copy(self) -> None:
+        source = self.TURING_SOURCE.replace(
+            "shared.global [%r17], [%rd1], 4",
+            "shared.global [%r17], [%rd1], 12",
+        )
+        with self.assertRaisesRegex(patcher.PatchError, "asynchronous copy"):
+            patcher.transform_ptx(source, patcher.TURING)
+
+    def test_reject_unsupported_turing_mbarrier(self) -> None:
+        source = self.TURING_SOURCE.replace(
+            "mbarrier.init.shared.b64", "mbarrier.init.shared::cta.b64"
+        )
+        with self.assertRaisesRegex(patcher.PatchError, "mbarrier operation"):
+            patcher.transform_ptx(source, patcher.TURING)
 
     def test_transform_1024_byte_copy(self) -> None:
         source = self.SOURCE.replace("mov.b32 %r3, 512;", "mov.b32 %r3, 1024;")

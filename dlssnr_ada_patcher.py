@@ -663,6 +663,7 @@ def ptx_register_count(text: str, register: str) -> int:
 
 
 def fp8_pair_to_half_lines(source: str, destination: str) -> list[str]:
+    # Expand both E4M3 values exactly, including denormals, signed zero, and NaN.
     lines: list[str] = []
     for bit_offset in (0, 8):
         lines.extend(
@@ -713,6 +714,7 @@ def fp8_pair_to_half_lines(source: str, destination: str) -> list[str]:
 
 
 def half_pair_to_fp8_lines(source: str, destination: str) -> list[str]:
+    # Match cvt.rn.satfinite for both packed halves with integer RNE logic.
     lines = [f"mov.b32 dlssnr_f16_source, {source};"]
     for bit_offset in (0, 16):
         lines.extend(
@@ -854,6 +856,9 @@ def render_fp8_mma_run(
         for register, sources in packed_sources.items()
         if sources[2] < matches[0].start()
     }
+    # FP8 k32 and FP16 k16 distribute each fragment differently across a
+    # four-lane group. Each source register becomes two shuffled FP16 pairs;
+    # two k16 operations then cover the original k32 accumulation.
     has_encoded_operands = any(register not in mapped for register in operands)
 
     lines = ["{"]
@@ -1052,6 +1057,224 @@ def lower_fp8_operations(text: str, stats: TransformStats) -> str:
     return lower_fp8_conversions(text, stats)
 
 
+F16_MMA_REGISTER = r"(?:%r\d+|dlssnr_fp16_\d+_[01])"
+F16_MMA_PATTERN = re.compile(
+    r"mma\.sync\.aligned\.m16n8k16\.row\.col\.f16\.f16\.f16\.f16\s*"
+    r"\{\s*(?P<d0>%r\d+),\s*(?P<d1>%r\d+)\s*\}\s*,\s*"
+    rf"\{{\s*(?P<a0>{F16_MMA_REGISTER}),\s*"
+    rf"(?P<a1>{F16_MMA_REGISTER}),\s*"
+    rf"(?P<a2>{F16_MMA_REGISTER}),\s*"
+    rf"(?P<a3>{F16_MMA_REGISTER})\s*\}}\s*,\s*"
+    rf"\{{\s*(?P<b0>{F16_MMA_REGISTER}),\s*"
+    rf"(?P<b1>{F16_MMA_REGISTER})\s*\}}\s*,\s*"
+    r"\{\s*(?P<c0>%r\d+),\s*(?P<c1>%r\d+)\s*\}\s*;"
+)
+F16_MIN_MAX_PATTERN = re.compile(
+    r"(?P<operation>min|max)\.f16x2\s+"
+    r"(?P<destination>%r\d+),\s*(?P<first>%r\d+),\s*"
+    r"(?P<second>%r\d+)\s*;"
+)
+SIMPLE_ASYNC_COPY_PATTERN = re.compile(
+    r"cp\.async\.(?P<cache>ca|cg)\.shared\.global\s+"
+    r"\[(?P<destination>%r\d+)\],\s*\[(?P<source>%rd\d+)\],\s*"
+    r"(?P<size>4|8|16)\s*;"
+)
+ASYNC_COMMIT_PATTERN = re.compile(r"cp\.async\.commit_group\s*;")
+ASYNC_WAIT_PATTERN = re.compile(r"cp\.async\.wait_group\s+0\s*;")
+MBARRIER_INIT_PATTERN = re.compile(
+    r"mbarrier\.init\.shared\.b64\s+\[(%r\d+)\],\s*(%r\d+)\s*;"
+)
+MBARRIER_ARRIVE_PATTERN = re.compile(
+    r"mbarrier\.arrive\.shared::cta\.b64\s+"
+    r"(%rd\d+),\s*\[(%r\d+)\]\s*;"
+)
+MBARRIER_WAIT_PATTERN = re.compile(
+    r"mbarrier\.test_wait\.shared::cta\.b64\s+"
+    r"((?:%p\d+|[A-Za-z_][\w$]*)),\s*\[(%r\d+)\],\s*(%rd\d+)\s*;"
+)
+
+
+def lower_turing_mma(text: str, stats: TransformStats) -> str:
+    generic_count = len(
+        re.findall(
+            r"\bmma\.[^;]*\.m16n8k16\.[^;]*\.f16\.f16\.f16\.f16\b",
+            text,
+            re.DOTALL,
+        )
+    )
+    exact_count = len(F16_MMA_PATTERN.findall(text))
+    if exact_count != generic_count:
+        raise PatchError("An FP16 matrix operation has an unsupported form.")
+
+    def replace(match: re.Match[str]) -> str:
+        d0, d1 = match.group("d0"), match.group("d1")
+        c0, c1 = match.group("c0"), match.group("c1")
+        return "\n".join(
+            [
+                "mma.sync.aligned.m16n8k8.row.col.f16.f16.f16.f16 "
+                f"{{{d0}, {d1}}}, "
+                f"{{{match.group('a0')}, {match.group('a1')}}}, "
+                f"{{{match.group('b0')}}}, {{{c0}, {c1}}};",
+                "mma.sync.aligned.m16n8k8.row.col.f16.f16.f16.f16 "
+                f"{{{d0}, {d1}}}, "
+                f"{{{match.group('a2')}, {match.group('a3')}}}, "
+                f"{{{match.group('b1')}}}, {{{d0}, {d1}}};",
+            ]
+        )
+
+    text, count = F16_MMA_PATTERN.subn(replace, text)
+    stats.add("mma_k16", count)
+    return text
+
+
+def lower_turing_half_min_max(text: str, stats: TransformStats) -> str:
+    generic_count = len(re.findall(r"\b(?:min|max)\.f16(?:x2)?\b", text))
+    exact_count = len(F16_MIN_MAX_PATTERN.findall(text))
+    if exact_count != generic_count:
+        raise PatchError("A half-precision minimum or maximum has an unsupported form.")
+
+    def replace(match: re.Match[str]) -> str:
+        operation = match.group("operation")
+        lines = [
+            "{",
+            ".reg .b16 dlssnr_half_a0, dlssnr_half_a1;",
+            ".reg .b16 dlssnr_half_b0, dlssnr_half_b1;",
+            ".reg .b16 dlssnr_half_d0, dlssnr_half_d1;",
+            ".reg .f32 dlssnr_half_a, dlssnr_half_b, dlssnr_half_result;",
+            f"mov.b32 {{dlssnr_half_a0, dlssnr_half_a1}}, "
+            f"{match.group('first')};",
+            f"mov.b32 {{dlssnr_half_b0, dlssnr_half_b1}}, "
+            f"{match.group('second')};",
+        ]
+        for suffix in ("0", "1"):
+            lines.extend(
+                [
+                    f"cvt.f32.f16 dlssnr_half_a, dlssnr_half_a{suffix};",
+                    f"cvt.f32.f16 dlssnr_half_b, dlssnr_half_b{suffix};",
+                    f"{operation}.f32 dlssnr_half_result, "
+                    "dlssnr_half_a, dlssnr_half_b;",
+                    f"cvt.rn.f16.f32 dlssnr_half_d{suffix}, "
+                    "dlssnr_half_result;",
+                ]
+            )
+        lines.extend(
+            [
+                f"mov.b32 {match.group('destination')}, "
+                "{dlssnr_half_d0, dlssnr_half_d1};",
+                "}",
+            ]
+        )
+        return "\n".join(lines)
+
+    operation_counts = {
+        operation: len(
+            re.findall(rf"\b{operation}\.f16x2\b", text)
+        )
+        for operation in ("min", "max")
+    }
+    text = F16_MIN_MAX_PATTERN.sub(replace, text)
+    for operation, count in operation_counts.items():
+        stats.add(f"half_{operation}", count)
+    return text
+
+
+def lower_turing_async_copies(text: str, stats: TransformStats) -> str:
+    generic_count = len(re.findall(r"\bcp\.async(?:\.[^;\n]*)?\s*[^;\n]*;", text))
+    copy_count = len(SIMPLE_ASYNC_COPY_PATTERN.findall(text))
+    commit_count = len(ASYNC_COMMIT_PATTERN.findall(text))
+    wait_count = len(ASYNC_WAIT_PATTERN.findall(text))
+    if copy_count + commit_count + wait_count != generic_count:
+        raise PatchError("An asynchronous copy has an unsupported form for Turing.")
+    if commit_count != wait_count:
+        raise PatchError("Turing asynchronous copy groups are not paired.")
+
+    def replace(match: re.Match[str]) -> str:
+        size = int(match.group("size"))
+        register_count = size // 4
+        registers = [f"dlssnr_copy{index}" for index in range(register_count)]
+        if register_count == 1:
+            register_type = ".b32"
+            operand = registers[0]
+        else:
+            register_type = f".v{register_count}.b32"
+            operand = "{" + ", ".join(registers) + "}"
+        return "\n".join(
+            [
+                "{",
+                ".reg .b32 " + ", ".join(registers) + ";",
+                f"ld.global.{match.group('cache')}{register_type} {operand}, "
+                f"[{match.group('source')}];",
+                f"st.shared{register_type} [{match.group('destination')}], "
+                f"{operand};",
+                "}",
+            ]
+        )
+
+    text, count = SIMPLE_ASYNC_COPY_PATTERN.subn(replace, text)
+    text = ASYNC_COMMIT_PATTERN.sub("", text)
+    text = ASYNC_WAIT_PATTERN.sub("", text)
+    stats.add("async_copy", count)
+    stats.add("async_group", commit_count)
+    return text
+
+
+def lower_turing_mbarriers(text: str, stats: TransformStats) -> str:
+    generic_count = len(re.findall(r"\bmbarrier\.[^;\n]+;", text))
+    init_matches = list(MBARRIER_INIT_PATTERN.finditer(text))
+    init_count = len(init_matches)
+    arrive_count = len(MBARRIER_ARRIVE_PATTERN.findall(text))
+    wait_count = len(MBARRIER_WAIT_PATTERN.findall(text))
+    if init_count + arrive_count + wait_count != generic_count:
+        raise PatchError("An mbarrier operation has an unsupported form for Turing.")
+    if arrive_count != wait_count:
+        raise PatchError("Turing mbarrier arrivals and waits are not paired.")
+
+    # A full-CTA barrier is equivalent only when the source mbarrier expects one
+    # arrival from every thread in the block.
+    for match in init_matches:
+        start = max(0, match.start() - 2000)
+        prefix = text[start : match.start()]
+        count_register = match.group(2)
+        multiply_pattern = re.compile(
+            r"mul\.lo\.s32\s+"
+            + re.escape(count_register)
+            + r",\s*(%r\d+),\s*(%r\d+)\s*;"
+        )
+        multiply_matches = list(multiply_pattern.finditer(prefix))
+        if not multiply_matches:
+            raise PatchError("A Turing mbarrier does not count all block threads.")
+        multiply = multiply_matches[-1]
+        dimensions = []
+        for register in multiply.groups():
+            assignment_pattern = re.compile(
+                r"mov\.u32\s+"
+                + re.escape(register)
+                + r",\s*(%ntid\.[xyz])\s*;"
+            )
+            assignments = list(
+                assignment_pattern.finditer(prefix, 0, multiply.start())
+            )
+            if not assignments:
+                raise PatchError("A Turing mbarrier has an unknown arrival count.")
+            dimensions.append(assignments[-1].group(1))
+        if dimensions != ["%ntid.x", "%ntid.y"]:
+            raise PatchError("A Turing mbarrier does not count all block threads.")
+
+    text = MBARRIER_INIT_PATTERN.sub("", text)
+    text = MBARRIER_ARRIVE_PATTERN.sub("bar.sync 0;", text)
+    text = MBARRIER_WAIT_PATTERN.sub(r"mov.pred \1, 1;", text)
+    stats.add("barrier_init", init_count)
+    stats.add("barrier_sync", arrive_count)
+    return text
+
+
+def lower_turing_operations(text: str, stats: TransformStats) -> str:
+    text = lower_turing_mma(text, stats)
+    text = lower_turing_half_min_max(text, stats)
+    text = lower_turing_async_copies(text, stats)
+    return lower_turing_mbarriers(text, stats)
+
+
 def transform_ptx(
     source: str, target: Architecture = ADA
 ) -> tuple[str, TransformStats]:
@@ -1179,7 +1402,8 @@ def transform_ptx(
             raise PatchError(f"Unsupported mbarrier arrival count {count}.")
 
     # The supported 512- and 1024-byte bulk forms become per-lane 16-byte
-    # copies. Each lane waits for its normal async-copy group before arrival.
+    # copies. Targets with asynchronous copies wait for their normal copy group;
+    # Turing uses synchronous vector loads and stores instead.
     def replace_bulk(match: re.Match[str]) -> str:
         destination, source_address, size_register, _barrier = match.groups()
         copy_size = previous_literal_assignment(output, match.start(), size_register)
@@ -1188,23 +1412,43 @@ def transform_ptx(
         copies = []
         for offset in range(0, copy_size, 512):
             suffix = f"+{offset}" if offset else ""
-            copies.append(
-                "cp.async.cg.shared.global "
-                f"[dlss5_address{suffix}], [dlss5_source{suffix}], 16;"
+            if target == TURING:
+                copies.extend(
+                    [
+                        "ld.global.cg.v4.b32 "
+                        "{dlss5_copy0, dlss5_copy1, dlss5_copy2, "
+                        f"dlss5_copy3}}, [dlss5_source{suffix}];",
+                        f"st.shared.v4.b32 [dlss5_address{suffix}], "
+                        "{dlss5_copy0, dlss5_copy1, dlss5_copy2, "
+                        "dlss5_copy3};",
+                    ]
+                )
+            else:
+                copies.append(
+                    "cp.async.cg.shared.global "
+                    f"[dlss5_address{suffix}], [dlss5_source{suffix}], 16;"
+                )
+        declarations = ""
+        completion = "cp.async.commit_group;\ncp.async.wait_group 0;\n"
+        if target == TURING:
+            declarations = (
+                ".reg .b32 dlss5_copy0, dlss5_copy1, dlss5_copy2, "
+                "dlss5_copy3;\n"
             )
+            completion = ""
         operations = "\n".join(copies)
         return (
             "{\n"
             ".reg .u32 dlss5_lane, dlss5_offset, dlss5_address;\n"
             ".reg .u64 dlss5_offset64, dlss5_source;\n"
+            f"{declarations}"
             "mov.u32 dlss5_lane, %laneid;\n"
             "shl.b32 dlss5_offset, dlss5_lane, 4;\n"
             f"add.s32 dlss5_address, {destination}, dlss5_offset;\n"
             "cvt.u64.u32 dlss5_offset64, dlss5_offset;\n"
             f"add.s64 dlss5_source, {source_address}, dlss5_offset64;\n"
             f"{operations}\n"
-            "cp.async.commit_group;\n"
-            "cp.async.wait_group 0;\n"
+            f"{completion}"
             "}"
         )
 
@@ -1261,6 +1505,9 @@ def transform_ptx(
     )
     stats.add("min_relu", min_relu_count)
 
+    if target == TURING:
+        output = lower_turing_operations(output, stats)
+
     unsupported = (
         "elect.sync",
         "cp.async.bulk",
@@ -1272,6 +1519,8 @@ def transform_ptx(
     )
     if target.cuda < ADA.cuda:
         unsupported += ("e4m3",)
+    if target == TURING:
+        unsupported += ("m16n8k16", "min.f16", "max.f16", "cp.async", "mbarrier")
     remaining = [token for token in unsupported if token in output]
     if remaining:
         raise PatchError(
@@ -1749,10 +1998,14 @@ def repack_fatbin(
     transformed_path = work_dir / f"{target.name}.ptx"
     transformed_path.write_bytes(transformed_ptx.encode("utf-8"))
     target_cubin = work_dir / f"{target.name}.{target.cuda_name}.cubin"
+    # Turing's expanded k8 MMA stream is intentionally repetitive. O1 keeps
+    # that stream compressible enough for the DLL's fixed fatbin allocations.
+    ptxas_options = ["--opt-level=1"] if target == TURING else []
     run_tool(
         [
             tools.ptxas,
             f"--gpu-name={target.cuda_name}",
+            *ptxas_options,
             transformed_path,
             "--output-file",
             target_cubin,
