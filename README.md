@@ -8,6 +8,10 @@ corresponding NGX architecture paths, verifies the rebuilt containers, and
 updates the PE checksum. It does not include, download, or distribute NVIDIA
 DLLs or model files.
 
+> **Safety warning:** Patching invalidates the DLL's NVIDIA Authenticode
+> signature and can trigger anti-cheat or file-integrity systems. Do not use a
+> patched DLL with online, competitive, or anti-cheat-protected software.
+
 ## Requirements
 
 - Python 3.10 or newer
@@ -45,10 +49,6 @@ python dlssnr_patcher.py --turing --ampere "C:\path\to\nvngx_dlssnr.dll"
 By default, the original becomes `nvngx_dlssnr.dll.bak` and the patched file
 takes its place. Use `--output patched.dll` to keep the input unchanged, or
 `--dry-run` to compile and verify without writing an output file.
-
-> **Safety warning:** Patching invalidates the DLL's NVIDIA Authenticode
-> signature and can trigger anti-cheat or file-integrity systems. Do not use a
-> patched DLL with online, competitive, or anti-cheat-protected software.
 
 Run `python dlssnr_patcher.py --help` for every option.
 
