@@ -644,10 +644,12 @@ def previous_literal_assignment(
 
 
 FP8_DOWN_PATTERN = re.compile(
+    r"(?P<guard>@!?%p\d+\s+)?"
     r"cvt\.rn\.satfinite\.e4m3x2\.f16x2\s+"
     r"(?P<destination>%rs\d+),\s*(?P<source>%r\d+)\s*;"
 )
 FP8_UP_PATTERN = re.compile(
+    r"(?P<guard>@!?%p\d+\s+)?"
     r"cvt\.rn\.f16x2\.e4m3x2\s+"
     r"(?P<destination>%r\d+),\s*(?P<source>%rs\d+)\s*;"
 )
@@ -656,6 +658,7 @@ FP8_PACK_PATTERN = re.compile(
     r"\{\s*(?P<low>%rs\d+),\s*(?P<high>%rs\d+)\s*\}\s*;"
 )
 FP8_MMA_PATTERN = re.compile(
+    r"(?P<guard>@!?%p\d+\s+)?"
     r"mma\.sync\.aligned\.m16n8k32\.row\.col\.f16\.e4m3\.e4m3\.f16\s*"
     r"\{\s*(?P<d0>%r\d+),\s*(?P<d1>%r\d+)\s*\}\s*,\s*"
     r"\{\s*(?P<a0>%r\d+),\s*(?P<a1>%r\d+),\s*"
@@ -1057,9 +1060,15 @@ def lower_fp8_operations(text: str, stats: TransformStats) -> str:
             r"\bmma\.[^;]*\.f16\.e4m3\.e4m3\.f16\b", text, re.DOTALL
         )
     )
-    exact_mma_count = len(FP8_MMA_PATTERN.findall(text))
-    if exact_mma_count != generic_mma_count:
+    mma_matches = list(FP8_MMA_PATTERN.finditer(text))
+    if len(mma_matches) != generic_mma_count:
         raise PatchError("An FP8 matrix operation has an unsupported form.")
+    if any(match.group("guard") for match in mma_matches):
+        raise PatchError("A predicated FP8 matrix operation is unsupported.")
+    if any(match.group("guard") for match in FP8_DOWN_PATTERN.finditer(text)):
+        raise PatchError("A predicated FP16-to-FP8 conversion is unsupported.")
+    if any(match.group("guard") for match in FP8_UP_PATTERN.finditer(text)):
+        raise PatchError("A predicated FP8-to-FP16 conversion is unsupported.")
     text, mma_count = lower_fp8_mma(text)
     stats.add("fp8_mma", mma_count)
     return lower_fp8_conversions(text, stats)

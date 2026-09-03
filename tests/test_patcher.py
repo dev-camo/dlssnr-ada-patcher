@@ -604,12 +604,39 @@ mbarrier.try_wait.shared::cta.b64 %p1, [%r18], %rd2;
         with self.assertRaisesRegex(patcher.PatchError, "FP8 matrix operation"):
             patcher.transform_ptx(source, patcher.AMPERE)
 
+    def test_reject_predicated_fp8_matrix_operation(self) -> None:
+        source = self.FP8_SOURCE.replace(
+            "mma.sync.aligned.m16n8k32",
+            "@%p2 mma.sync.aligned.m16n8k32",
+        )
+        with self.assertRaisesRegex(patcher.PatchError, "predicated FP8 matrix"):
+            patcher.transform_ptx(source, patcher.AMPERE)
+
     def test_reject_unsupported_fp8_conversion(self) -> None:
         source = self.FP8_SOURCE.replace(
             "cvt.rn.f16x2.e4m3x2", "cvt.rn.relu.f16x2.e4m3x2"
         )
         with self.assertRaisesRegex(patcher.PatchError, "FP8-to-FP16 conversion"):
             patcher.transform_ptx(source, patcher.AMPERE)
+
+    def test_reject_predicated_fp8_conversions(self) -> None:
+        cases = (
+            (
+                "cvt.rn.satfinite.e4m3x2.f16x2",
+                "@%p2 cvt.rn.satfinite.e4m3x2.f16x2",
+                "predicated FP16-to-FP8 conversion",
+            ),
+            (
+                "cvt.rn.f16x2.e4m3x2",
+                "@!%p3 cvt.rn.f16x2.e4m3x2",
+                "predicated FP8-to-FP16 conversion",
+            ),
+        )
+        for instruction, replacement, message in cases:
+            with self.subTest(instruction=instruction):
+                source = self.FP8_SOURCE.replace(instruction, replacement, 1)
+                with self.assertRaisesRegex(patcher.PatchError, message):
+                    patcher.transform_ptx(source, patcher.AMPERE)
 
     def test_transform_turing_operations(self) -> None:
         output, stats = patcher.transform_ptx(self.TURING_SOURCE, patcher.TURING)
