@@ -12,7 +12,7 @@
 
 ```text
 python -m unittest discover -s tests -v
-python dlssnr_ada_patcher.py --help
+python dlssnr_patcher.py --help
 ```
 
 ## Checklist

@@ -1,3 +1,4 @@
+import io
 import os
 import stat
 import struct
@@ -6,7 +7,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-import dlssnr_ada_patcher as patcher
+import dlssnr_patcher as patcher
 
 
 def make_record(kind: int, flags: int, payload: bytes = b"data") -> bytes:
@@ -23,11 +24,58 @@ def make_fatbin(*records: bytes) -> bytes:
 
 
 class OutputTests(unittest.TestCase):
+    def test_no_arguments_print_expanded_usage(self) -> None:
+        stderr = io.StringIO()
+        with (
+            mock.patch("sys.stderr", stderr),
+            mock.patch.object(patcher, "find_cuda_tools") as find_cuda_tools,
+        ):
+            result = patcher.main([])
+
+        self.assertEqual(result, 2)
+        self.assertIn("target architectures:", stderr.getvalue())
+        self.assertIn("Build for every supported RTX generation", stderr.getvalue())
+        self.assertIn("--turing --ampere", stderr.getvalue())
+        self.assertIn("error: an input DLL path is required", stderr.getvalue())
+        find_cuda_tools.assert_not_called()
+
     def test_short_output_flag(self) -> None:
         arguments = patcher.build_parser().parse_args(
             ["nvngx_dlssnr.dll", "-o", "patched.dll"]
         )
         self.assertEqual(arguments.output, Path("patched.dll"))
+
+    def test_no_architecture_flags_selects_every_generation(self) -> None:
+        arguments = patcher.build_parser().parse_args(["nvngx_dlssnr.dll"])
+        self.assertEqual(
+            patcher.selected_architectures(arguments),
+            patcher.SUPPORTED_ARCHITECTURES,
+        )
+
+    def test_long_architecture_flags_can_be_combined(self) -> None:
+        arguments = patcher.build_parser().parse_args(
+            ["nvngx_dlssnr.dll", "--ada", "--turing"]
+        )
+        self.assertEqual(
+            patcher.selected_architectures(arguments),
+            (patcher.TURING, patcher.ADA),
+        )
+
+    def test_short_architecture_flags(self) -> None:
+        flags = {
+            "-t": patcher.TURING,
+            "-A": patcher.AMPERE,
+            "-a": patcher.ADA,
+            "-b": patcher.BLACKWELL,
+        }
+        for flag, architecture in flags.items():
+            with self.subTest(flag=flag):
+                arguments = patcher.build_parser().parse_args(
+                    ["nvngx_dlssnr.dll", flag]
+                )
+                self.assertEqual(
+                    patcher.selected_architectures(arguments), (architecture,)
+                )
 
     def test_default_plan_replaces_input_and_uses_backup(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -100,7 +148,7 @@ class OutputTests(unittest.TestCase):
 
             with (
                 mock.patch(
-                    "dlssnr_ada_patcher.os.replace", side_effect=OSError("test failure")
+                    "dlssnr_patcher.os.replace", side_effect=OSError("test failure")
                 ),
                 self.assertRaisesRegex(patcher.PatchError, "Cannot install"),
             ):
@@ -117,7 +165,7 @@ class OutputTests(unittest.TestCase):
 
             with (
                 mock.patch(
-                    "dlssnr_ada_patcher.os.replace", side_effect=KeyboardInterrupt
+                    "dlssnr_patcher.os.replace", side_effect=KeyboardInterrupt
                 ),
                 self.assertRaises(KeyboardInterrupt),
             ):
@@ -138,7 +186,7 @@ class OutputTests(unittest.TestCase):
 
             with (
                 mock.patch(
-                    "dlssnr_ada_patcher.stage_output", side_effect=stage_then_create
+                    "dlssnr_patcher.stage_output", side_effect=stage_then_create
                 ),
                 self.assertRaisesRegex(patcher.PatchError, "now exists"),
             ):
@@ -416,6 +464,18 @@ class PeTests(unittest.TestCase):
 
 
 class FatbinTests(unittest.TestCase):
+    def test_normalize_architectures_deduplicates_targets(self) -> None:
+        self.assertEqual(
+            patcher.normalize_architectures(
+                (patcher.ADA, patcher.TURING, patcher.ADA)
+            ),
+            (patcher.ADA, patcher.TURING),
+        )
+
+    def test_normalize_architectures_rejects_empty_selection(self) -> None:
+        with self.assertRaisesRegex(patcher.PatchError, "At least one"):
+            patcher.normalize_architectures(())
+
     def test_find_and_parse_fatbin(self) -> None:
         fatbin = make_fatbin(make_record(1, 0x8041), make_record(2, 0x1000041))
         data = b"prefix" + fatbin + b"suffix"
@@ -461,6 +521,37 @@ red.global.v4.f16x2.add.noftz [%rd3], {%r5, %r6, %r7, %r8};
 fence.release.gpu;
 min.relu.s32 %r10, %r11, %r12;
 """
+    FP8_SOURCE = """
+.version 9.4
+.target sm_120
+.address_size 64
+cvt.rn.satfinite.e4m3x2.f16x2 %rs1, %r10;
+cvt.rn.satfinite.e4m3x2.f16x2 %rs2, %r11;
+mov.b32 %r20, {%rs1, %rs2};
+mov.b16 %rs8, %rs1;
+cvt.rn.f16x2.e4m3x2 %r30, %rs9;
+mma.sync.aligned.m16n8k32.row.col.f16.e4m3.e4m3.f16
+    {%r40, %r41}, {%r20, %r21, %r22, %r23}, {%r24, %r25}, {%r26, %r27};
+"""
+    TURING_SOURCE = """
+.version 9.4
+.target sm_120
+.address_size 64
+mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16
+    {%r1, %r2}, {%r3, %r4, %r5, %r6}, {%r7, %r8}, {%r9, %r10};
+min.f16x2 %r11, %r12, %r13;
+max.f16x2 %r14, %r15, %r16;
+cp.async.ca.shared.global [%r17], [%rd1], 4;
+cp.async.commit_group;
+cp.async.wait_group 0;
+mov.u32 %r21, %ntid.x;
+mov.u32 %r22, %ntid.y;
+mul.lo.s32 %r19, %r21, %r22;
+mbarrier.init.shared.b64 [%r18], %r19;
+mov.b32 %r20, 1;
+mbarrier.arrive.shared::cta.b64 %rd2, [%r18], %r20;
+mbarrier.try_wait.shared::cta.b64 %p1, [%r18], %rd2;
+"""
 
     def test_transform_supported_operations(self) -> None:
         output, stats = patcher.transform_ptx(self.SOURCE)
@@ -474,6 +565,210 @@ min.relu.s32 %r10, %r11, %r12;
         self.assertIn("fence.acq_rel.gpu;", output)
         self.assertIn("max.s32 %r10, %r10, 0;", output)
         self.assertEqual(stats.values["bulk_copy"], 1)
+
+    def test_transform_uses_selected_target(self) -> None:
+        output, _stats = patcher.transform_ptx(self.SOURCE, patcher.AMPERE)
+        self.assertIn(".target sm_86", output)
+        self.assertNotIn(".target sm_89", output)
+
+    def test_reject_predicated_expanding_operations(self) -> None:
+        cases = (
+            (
+                "red.global.v4.f16x2.add.noftz",
+                "@%p2 red.global.v4.f16x2.add.noftz",
+                "predicated vector reduction",
+            ),
+            (
+                "min.relu.s32",
+                "@!P2 min.relu.s32",
+                "predicated fused minimum/ReLU",
+            ),
+        )
+        for instruction, replacement, message in cases:
+            with self.subTest(instruction=instruction):
+                source = self.SOURCE.replace(instruction, replacement)
+                with self.assertRaisesRegex(patcher.PatchError, message):
+                    patcher.transform_ptx(source)
+
+    def test_transform_ampere_fp8_operations(self) -> None:
+        output, stats = patcher.transform_ptx(self.FP8_SOURCE, patcher.AMPERE)
+
+        self.assertNotIn(".e4m3", output)
+        self.assertEqual(
+            output.count(
+                "mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16"
+            ),
+            2,
+        )
+        self.assertIn("shfl.sync.idx.b32", output)
+        self.assertIn("cvt.u32.u16 dlssnr_fp8_source, %rs9;", output)
+        self.assertEqual(stats.values["fp8_mma"], 1)
+        self.assertEqual(stats.values["fp16_to_fp8"], 1)
+        self.assertEqual(stats.values["fp8_to_fp16"], 1)
+
+    def test_transform_ada_keeps_native_fp8_operations(self) -> None:
+        output, stats = patcher.transform_ptx(self.FP8_SOURCE, patcher.ADA)
+        self.assertIn(".e4m3", output)
+        self.assertNotIn("fp8_mma", stats.values)
+
+    def test_transform_blackwell_keeps_native_ptx(self) -> None:
+        output, stats = patcher.transform_ptx(self.SOURCE, patcher.BLACKWELL)
+        self.assertIn(".version 9.4", output)
+        self.assertIn(".target sm_120", output)
+        self.assertIn("cp.async.bulk", output)
+        self.assertNotIn("ptx_version", stats.values)
+
+    def test_reject_unsupported_fp8_matrix_shape(self) -> None:
+        source = self.FP8_SOURCE.replace(".m16n8k32.row.col", ".m16n8k32.col.row")
+        with self.assertRaisesRegex(patcher.PatchError, "FP8 matrix operation"):
+            patcher.transform_ptx(source, patcher.AMPERE)
+
+    def test_reject_predicated_fp8_matrix_operation(self) -> None:
+        source = self.FP8_SOURCE.replace(
+            "mma.sync.aligned.m16n8k32",
+            "@%p2 mma.sync.aligned.m16n8k32",
+        )
+        with self.assertRaisesRegex(patcher.PatchError, "predicated FP8 matrix"):
+            patcher.transform_ptx(source, patcher.AMPERE)
+
+    def test_reject_unsupported_fp8_conversion(self) -> None:
+        source = self.FP8_SOURCE.replace(
+            "cvt.rn.f16x2.e4m3x2", "cvt.rn.relu.f16x2.e4m3x2"
+        )
+        with self.assertRaisesRegex(patcher.PatchError, "FP8-to-FP16 conversion"):
+            patcher.transform_ptx(source, patcher.AMPERE)
+
+    def test_reject_predicated_fp8_conversions(self) -> None:
+        cases = (
+            (
+                "cvt.rn.satfinite.e4m3x2.f16x2",
+                "@%p2 cvt.rn.satfinite.e4m3x2.f16x2",
+                "predicated FP16-to-FP8 conversion",
+            ),
+            (
+                "cvt.rn.f16x2.e4m3x2",
+                "@!%p3 cvt.rn.f16x2.e4m3x2",
+                "predicated FP8-to-FP16 conversion",
+            ),
+        )
+        for instruction, replacement, message in cases:
+            with self.subTest(instruction=instruction):
+                source = self.FP8_SOURCE.replace(instruction, replacement, 1)
+                with self.assertRaisesRegex(patcher.PatchError, message):
+                    patcher.transform_ptx(source, patcher.AMPERE)
+
+    def test_reject_predicated_fp8_pack(self) -> None:
+        source = self.FP8_SOURCE.replace(
+            "mov.b32 %r20", "@P1 mov.b32 %r20"
+        )
+        with self.assertRaisesRegex(patcher.PatchError, "predicated FP8 pack"):
+            patcher.transform_ptx(source, patcher.AMPERE)
+
+    def test_transform_turing_operations(self) -> None:
+        output, stats = patcher.transform_ptx(self.TURING_SOURCE, patcher.TURING)
+
+        self.assertNotIn("m16n8k16", output)
+        self.assertEqual(output.count("m16n8k8.row.col.f16.f16.f16.f16"), 2)
+        self.assertNotIn("min.f16", output)
+        self.assertNotIn("max.f16", output)
+        self.assertIn("min.f32", output)
+        self.assertIn("max.f32", output)
+        self.assertIn("ld.global.ca.b32", output)
+        self.assertIn("st.shared.b32", output)
+        self.assertNotIn("cp.async", output)
+        self.assertNotIn("mbarrier", output)
+        self.assertIn("bar.sync 0;", output)
+        self.assertEqual(stats.values["mma_k16"], 1)
+        self.assertEqual(stats.values["half_min"], 1)
+        self.assertEqual(stats.values["half_max"], 1)
+        self.assertEqual(stats.values["async_copy"], 1)
+        self.assertEqual(stats.values["barrier_sync"], 1)
+
+    def test_transform_turing_bulk_copy(self) -> None:
+        output, _stats = patcher.transform_ptx(self.SOURCE, patcher.TURING)
+        self.assertIn("ld.global.cg.v4.b32", output)
+        self.assertIn("st.shared.v4.b32", output)
+        self.assertNotIn("cp.async", output)
+        self.assertNotIn("mbarrier", output)
+
+    def test_reject_unsupported_turing_matrix_shape(self) -> None:
+        source = self.TURING_SOURCE.replace(
+            ".m16n8k16.row.col", ".m16n8k16.col.row"
+        )
+        with self.assertRaisesRegex(patcher.PatchError, "FP16 matrix operation"):
+            patcher.transform_ptx(source, patcher.TURING)
+
+    def test_reject_predicated_turing_matrix_operation(self) -> None:
+        for guard in ("@%p2", "@!P2"):
+            with self.subTest(guard=guard):
+                source = self.TURING_SOURCE.replace(
+                    "mma.sync.aligned.m16n8k16",
+                    f"{guard} mma.sync.aligned.m16n8k16",
+                )
+                with self.assertRaisesRegex(
+                    patcher.PatchError, "predicated FP16 matrix"
+                ):
+                    patcher.transform_ptx(source, patcher.TURING)
+
+    def test_reject_unsupported_turing_half_operation(self) -> None:
+        source = self.TURING_SOURCE.replace("min.f16x2", "min.f16")
+        with self.assertRaisesRegex(patcher.PatchError, "minimum or maximum"):
+            patcher.transform_ptx(source, patcher.TURING)
+
+    def test_reject_predicated_turing_half_operation(self) -> None:
+        source = self.TURING_SOURCE.replace("min.f16x2", "@%p2 min.f16x2")
+        with self.assertRaisesRegex(patcher.PatchError, "predicated half-precision"):
+            patcher.transform_ptx(source, patcher.TURING)
+
+    def test_reject_unsupported_turing_async_copy(self) -> None:
+        source = self.TURING_SOURCE.replace(
+            "shared.global [%r17], [%rd1], 4",
+            "shared.global [%r17], [%rd1], 12",
+        )
+        with self.assertRaisesRegex(patcher.PatchError, "asynchronous copy"):
+            patcher.transform_ptx(source, patcher.TURING)
+
+    def test_reject_predicated_turing_async_copy(self) -> None:
+        source = self.TURING_SOURCE.replace(
+            "cp.async.ca.shared.global",
+            "@!%p2 cp.async.ca.shared.global",
+        )
+        with self.assertRaisesRegex(patcher.PatchError, "predicated asynchronous copy"):
+            patcher.transform_ptx(source, patcher.TURING)
+
+    def test_reject_predicated_turing_async_group_operations(self) -> None:
+        for instruction in ("cp.async.commit_group", "cp.async.wait_group"):
+            with self.subTest(instruction=instruction):
+                source = self.TURING_SOURCE.replace(
+                    instruction, f"@%p2 {instruction}"
+                )
+                with self.assertRaisesRegex(
+                    patcher.PatchError, "predicated asynchronous copy"
+                ):
+                    patcher.transform_ptx(source, patcher.TURING)
+
+    def test_reject_unsupported_turing_mbarrier(self) -> None:
+        source = self.TURING_SOURCE.replace(
+            "mbarrier.init.shared.b64", "mbarrier.init.shared::cta.b64"
+        )
+        with self.assertRaisesRegex(patcher.PatchError, "mbarrier operation"):
+            patcher.transform_ptx(source, patcher.TURING)
+
+    def test_reject_predicated_turing_mbarrier_operations(self) -> None:
+        instructions = (
+            "mbarrier.init.shared.b64",
+            "mbarrier.arrive.shared::cta.b64",
+            "mbarrier.try_wait.shared::cta.b64",
+        )
+        for instruction in instructions:
+            with self.subTest(instruction=instruction):
+                source = self.TURING_SOURCE.replace(
+                    instruction, f"@%p2 {instruction}"
+                )
+                with self.assertRaisesRegex(
+                    patcher.PatchError, "predicated mbarrier operation"
+                ):
+                    patcher.transform_ptx(source, patcher.TURING)
 
     def test_transform_1024_byte_copy(self) -> None:
         source = self.SOURCE.replace("mov.b32 %r3, 512;", "mov.b32 %r3, 1024;")
@@ -496,12 +791,30 @@ min.relu.s32 %r10, %r11, %r12;
         with self.assertRaisesRegex(patcher.PatchError, "ordered in supported groups"):
             patcher.transform_ptx(source)
 
+    def test_reject_predicated_bulk_copy(self) -> None:
+        source = self.SOURCE.replace(
+            "cp.async.bulk.shared::cta.global",
+            "@!P1 cp.async.bulk.shared::cta.global",
+        )
+        with self.assertRaisesRegex(patcher.PatchError, "predicated bulk-copy"):
+            patcher.transform_ptx(source)
+
     def test_reject_mismatched_bulk_expectation(self) -> None:
         source = self.SOURCE.replace(
             "mbarrier.expect_tx.relaxed.cta.shared::cta.b64 [%r2], %r3;",
             "mbarrier.expect_tx.relaxed.cta.shared::cta.b64 [%r9], %r3;",
         )
         with self.assertRaisesRegex(patcher.PatchError, "do not match"):
+            patcher.transform_ptx(source)
+
+    def test_reject_predicated_transaction_expectation(self) -> None:
+        source = self.SOURCE.replace(
+            "mbarrier.expect_tx.relaxed.cta.shared::cta.b64",
+            "@P1 mbarrier.expect_tx.relaxed.cta.shared::cta.b64",
+        )
+        with self.assertRaisesRegex(
+            patcher.PatchError, "predicated transaction expectation"
+        ):
             patcher.transform_ptx(source)
 
     def test_reject_mismatched_barrier_state(self) -> None:
@@ -602,6 +915,30 @@ class HostCaseTests(unittest.TestCase):
             [(patch.offset, patch.success_offset) for patch in patches],
             [(first_ada, first_success), (second_ada, second_success)],
         )
+
+    def test_patch_selected_architecture_cases(self) -> None:
+        data = bytearray(b"\x90" * 16)
+        values = (0x140, 0x160, 0x170, 0x190, 0x180, 0x1A0)
+        start, _ada_case, success = self.add_case_table(data, values)
+        turing_case = start + values.index(patcher.TURING.ngx) * 7
+        ampere_case = start + values.index(patcher.AMPERE.ngx) * 7
+
+        patches = patcher.patch_architecture_cases(
+            data, (patcher.TURING, patcher.AMPERE)
+        )
+
+        self.assertEqual(
+            [
+                (patch.architecture, patch.offset, patch.success_offset)
+                for patch in patches
+            ],
+            [
+                ("turing", turing_case, success),
+                ("ampere", ampere_case, success),
+            ],
+        )
+        self.assertEqual(data[turing_case : turing_case + 2], b"\x33\xf6")
+        self.assertEqual(data[ampere_case : ampere_case + 2], b"\x33\xf6")
 
     def test_patch_ada_case_with_near_success_branch(self) -> None:
         data = bytearray(b"\x90" * 16)

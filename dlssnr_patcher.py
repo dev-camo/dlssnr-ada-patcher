@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Add Ada CUDA images to a user-supplied DLSS Neural Rendering DLL."""
+"""DLSS Neural Rendering Patcher command-line implementation."""
 
 from __future__ import annotations
 
@@ -21,13 +21,34 @@ FATBIN_MAGIC = 0xBA55ED50
 FATBIN_MAGIC_BYTES = struct.pack("<I", FATBIN_MAGIC)
 PE_MACHINE_AMD64 = 0x8664
 PE32_PLUS_MAGIC = 0x20B
-# CUDA names the Ada target sm_89. PTX newer than 9.3 is capped before
-# compilation because this patch targets the Ada toolchain's supported form.
-TARGET_ARCH = 89
-MAX_ADA_PTX_VERSION = (9, 3)
-# NGX uses a different numeric value and name for the host-side Ada checks.
-TARGET_NGX_ARCH = 0x190
-TARGET_NGX_ARCH_NAME = "NVSDK_NGX_GPU_Arch_Ada"
+MAX_COMPATIBLE_PTX_VERSION = (9, 3)
+
+
+@dataclass(frozen=True)
+class Architecture:
+    name: str
+    cuda: int
+    ngx: int
+    ngx_name: str
+
+    @property
+    def cuda_name(self) -> str:
+        return f"sm_{self.cuda}"
+
+
+TURING = Architecture("turing", 75, 0x160, "NVSDK_NGX_GPU_Arch_Turing")
+AMPERE = Architecture("ampere", 86, 0x170, "NVSDK_NGX_GPU_Arch_Ampere")
+ADA = Architecture("ada", 89, 0x190, "NVSDK_NGX_GPU_Arch_Ada")
+BLACKWELL = Architecture(
+    "blackwell", 120, 0x1B0, "NVSDK_NGX_GPU_Arch_Blackwell2"
+)
+SUPPORTED_ARCHITECTURES = (TURING, AMPERE, ADA, BLACKWELL)
+
+# Keep the original Ada constants available for callers of the former helpers.
+TARGET_ARCH = ADA.cuda
+MAX_ADA_PTX_VERSION = MAX_COMPATIBLE_PTX_VERSION
+TARGET_NGX_ARCH = ADA.ngx
+TARGET_NGX_ARCH_NAME = ADA.ngx_name
 
 
 class PatchError(RuntimeError):
@@ -98,6 +119,14 @@ class Image:
     path: Path
 
 
+@dataclass
+class ArchitectureBuild:
+    architecture: Architecture
+    cubin_size: int
+    generated: bool
+    stats: TransformStats = field(default_factory=TransformStats)
+
+
 @dataclass(frozen=True)
 class ArchitectureRequirementPatch:
     interface: str
@@ -109,14 +138,24 @@ class ArchitectureRequirementPatch:
 class ArchitectureCasePatch:
     offset: int
     success_offset: int
+    architecture: str = ADA.name
 
 
 @dataclass(frozen=True)
 class HostPatchResult:
     requirements: tuple[ArchitectureRequirementPatch, ...]
-    ada_cases: tuple[ArchitectureCasePatch, ...]
+    architecture_cases: tuple[ArchitectureCasePatch, ...]
     architecture_export_offset: int | None
     architecture_metadata_offsets: tuple[int, ...]
+
+    @property
+    def ada_cases(self) -> tuple[ArchitectureCasePatch, ...]:
+        """Return Ada patches for callers that use the former result field."""
+        return tuple(
+            patch
+            for patch in self.architecture_cases
+            if patch.architecture == ADA.name
+        )
 
 
 @dataclass(frozen=True)
@@ -168,7 +207,7 @@ def read_pe_sections(data: bytes | bytearray) -> list[PeSection]:
 
 
 def strip_authenticode(data: bytearray) -> AuthenticodeRemoval | None:
-    """Remove the PE certificate table and preserve all other file data."""
+    """Remove the signature invalidated by patching while preserving other data."""
     sections = read_pe_sections(data)
     pe_offset = pe_header_offset(data)
     section_count = struct.unpack_from("<H", data, pe_offset + 6)[0]
@@ -604,13 +643,706 @@ def previous_literal_assignment(
     return int(value)
 
 
-def transform_ptx(source: str) -> tuple[str, TransformStats]:
+PTX_PREDICATE = r"(?:%p\d+|[A-Za-z_][\w$]*)"
+
+FP8_DOWN_PATTERN = re.compile(
+    rf"(?P<guard>@!?{PTX_PREDICATE}\s+)?"
+    r"cvt\.rn\.satfinite\.e4m3x2\.f16x2\s+"
+    r"(?P<destination>%rs\d+),\s*(?P<source>%r\d+)\s*;"
+)
+FP8_UP_PATTERN = re.compile(
+    rf"(?P<guard>@!?{PTX_PREDICATE}\s+)?"
+    r"cvt\.rn\.f16x2\.e4m3x2\s+"
+    r"(?P<destination>%r\d+),\s*(?P<source>%rs\d+)\s*;"
+)
+FP8_PACK_PATTERN = re.compile(
+    rf"(?P<guard>@!?{PTX_PREDICATE}\s+)?"
+    r"mov\.b32\s+(?P<destination>%r\d+),\s*"
+    r"\{\s*(?P<low>%rs\d+),\s*(?P<high>%rs\d+)\s*\}\s*;"
+)
+FP8_MMA_PATTERN = re.compile(
+    rf"(?P<guard>@!?{PTX_PREDICATE}\s+)?"
+    r"mma\.sync\.aligned\.m16n8k32\.row\.col\.f16\.e4m3\.e4m3\.f16\s*"
+    r"\{\s*(?P<d0>%r\d+),\s*(?P<d1>%r\d+)\s*\}\s*,\s*"
+    r"\{\s*(?P<a0>%r\d+),\s*(?P<a1>%r\d+),\s*"
+    r"(?P<a2>%r\d+),\s*(?P<a3>%r\d+)\s*\}\s*,\s*"
+    r"\{\s*(?P<b0>%r\d+),\s*(?P<b1>%r\d+)\s*\}\s*,\s*"
+    r"\{\s*(?P<c0>%r\d+),\s*(?P<c1>%r\d+)\s*\}\s*;"
+)
+PTX_ENTRY_PATTERN = re.compile(r"(?m)^\s*(?:\.visible\s+)?\.entry\b")
+
+
+def ptx_register_count(text: str, register: str) -> int:
+    return len(re.findall(re.escape(register) + r"(?!\d)", text))
+
+
+def fp8_pair_to_half_lines(source: str, destination: str) -> list[str]:
+    # Expand both E4M3 values exactly, including denormals, signed zero, and NaN.
+    lines: list[str] = []
+    for bit_offset in (0, 8):
+        lines.extend(
+            [
+                f"bfe.u32 dlssnr_fp8_value, {source}, {bit_offset}, 8;",
+                "and.b32 dlssnr_fp8_abs, dlssnr_fp8_value, 0x7f;",
+                "and.b32 dlssnr_fp8_sign, dlssnr_fp8_value, 0x80;",
+                "shl.b32 dlssnr_fp8_sign, dlssnr_fp8_sign, 8;",
+                "add.u32 dlssnr_fp8_normal, dlssnr_fp8_abs, 0x40;",
+                "shl.b32 dlssnr_fp8_normal, dlssnr_fp8_normal, 7;",
+                "or.b32 dlssnr_fp8_normal, dlssnr_fp8_normal, "
+                "dlssnr_fp8_sign;",
+                "and.b32 dlssnr_fp8_mantissa, dlssnr_fp8_abs, 7;",
+                "bfind.u32 dlssnr_fp8_msb, dlssnr_fp8_mantissa;",
+                "sub.u32 dlssnr_fp8_shift, 10, dlssnr_fp8_msb;",
+                "shl.b32 dlssnr_fp8_mantissa, dlssnr_fp8_mantissa, "
+                "dlssnr_fp8_shift;",
+                "and.b32 dlssnr_fp8_mantissa, dlssnr_fp8_mantissa, 0x3ff;",
+                "add.u32 dlssnr_fp8_exponent, dlssnr_fp8_msb, 6;",
+                "shl.b32 dlssnr_fp8_exponent, dlssnr_fp8_exponent, 10;",
+                "or.b32 dlssnr_fp8_subnormal, dlssnr_fp8_sign, "
+                "dlssnr_fp8_exponent;",
+                "or.b32 dlssnr_fp8_subnormal, dlssnr_fp8_subnormal, "
+                "dlssnr_fp8_mantissa;",
+                "and.b32 dlssnr_fp8_exponent, dlssnr_fp8_abs, 0x78;",
+                "setp.eq.u32 dlssnr_fp8_exp_zero, dlssnr_fp8_exponent, 0;",
+                "setp.eq.u32 dlssnr_fp8_zero, dlssnr_fp8_abs, 0;",
+                "setp.eq.u32 dlssnr_fp8_nan, dlssnr_fp8_abs, 0x7f;",
+                "selp.b32 dlssnr_fp8_result, dlssnr_fp8_subnormal, "
+                "dlssnr_fp8_normal, dlssnr_fp8_exp_zero;",
+                "selp.b32 dlssnr_fp8_result, dlssnr_fp8_sign, "
+                "dlssnr_fp8_result, dlssnr_fp8_zero;",
+                "selp.b32 dlssnr_fp8_result, 0x7fff, "
+                "dlssnr_fp8_result, dlssnr_fp8_nan;",
+            ]
+        )
+        if bit_offset == 0:
+            lines.append("mov.b32 dlssnr_fp8_low, dlssnr_fp8_result;")
+        else:
+            lines.extend(
+                [
+                    "shl.b32 dlssnr_fp8_result, dlssnr_fp8_result, 16;",
+                    f"or.b32 {destination}, dlssnr_fp8_low, "
+                    "dlssnr_fp8_result;",
+                ]
+            )
+    return lines
+
+
+def half_pair_to_fp8_lines(source: str, destination: str) -> list[str]:
+    # Match cvt.rn.satfinite for both packed halves with integer RNE logic.
+    lines = [f"mov.b32 dlssnr_f16_source, {source};"]
+    for bit_offset in (0, 16):
+        lines.extend(
+            [
+                f"bfe.u32 dlssnr_f16_value, dlssnr_f16_source, "
+                f"{bit_offset}, 16;",
+                "and.b32 dlssnr_f16_sign, dlssnr_f16_value, 0x8000;",
+                "shr.u32 dlssnr_f16_sign, dlssnr_f16_sign, 8;",
+                "and.b32 dlssnr_f16_abs, dlssnr_f16_value, 0x7fff;",
+                "shr.u32 dlssnr_f16_normal, dlssnr_f16_abs, 7;",
+                "sub.u32 dlssnr_f16_normal, dlssnr_f16_normal, 0x40;",
+                "and.b32 dlssnr_f16_remainder, dlssnr_f16_abs, 0x7f;",
+                "and.b32 dlssnr_f16_lsb, dlssnr_f16_normal, 1;",
+                "setp.gt.u32 dlssnr_f16_gt, dlssnr_f16_remainder, 0x40;",
+                "setp.eq.u32 dlssnr_f16_eq, dlssnr_f16_remainder, 0x40;",
+                "setp.ne.u32 dlssnr_f16_odd, dlssnr_f16_lsb, 0;",
+                "and.pred dlssnr_f16_tie, dlssnr_f16_eq, dlssnr_f16_odd;",
+                "or.pred dlssnr_f16_round, dlssnr_f16_gt, dlssnr_f16_tie;",
+                "selp.b32 dlssnr_f16_increment, 1, 0, dlssnr_f16_round;",
+                "add.u32 dlssnr_f16_normal, dlssnr_f16_normal, "
+                "dlssnr_f16_increment;",
+                "shr.u32 dlssnr_f16_exponent, dlssnr_f16_abs, 10;",
+                "and.b32 dlssnr_f16_exponent, dlssnr_f16_exponent, 0x1f;",
+                "and.b32 dlssnr_f16_mantissa, dlssnr_f16_abs, 0x3ff;",
+                "or.b32 dlssnr_f16_mantissa, dlssnr_f16_mantissa, 0x400;",
+                "sub.u32 dlssnr_f16_shift, 16, dlssnr_f16_exponent;",
+                "min.u32 dlssnr_f16_shift, dlssnr_f16_shift, 31;",
+                "shr.u32 dlssnr_f16_subnormal, dlssnr_f16_mantissa, "
+                "dlssnr_f16_shift;",
+                "shl.b32 dlssnr_f16_scale, 1, dlssnr_f16_shift;",
+                "sub.u32 dlssnr_f16_mask, dlssnr_f16_scale, 1;",
+                "and.b32 dlssnr_f16_remainder, dlssnr_f16_mantissa, "
+                "dlssnr_f16_mask;",
+                "shr.u32 dlssnr_f16_half, dlssnr_f16_scale, 1;",
+                "and.b32 dlssnr_f16_lsb, dlssnr_f16_subnormal, 1;",
+                "setp.gt.u32 dlssnr_f16_gt, dlssnr_f16_remainder, "
+                "dlssnr_f16_half;",
+                "setp.eq.u32 dlssnr_f16_eq, dlssnr_f16_remainder, "
+                "dlssnr_f16_half;",
+                "setp.ne.u32 dlssnr_f16_odd, dlssnr_f16_lsb, 0;",
+                "and.pred dlssnr_f16_tie, dlssnr_f16_eq, dlssnr_f16_odd;",
+                "or.pred dlssnr_f16_round, dlssnr_f16_gt, dlssnr_f16_tie;",
+                "selp.b32 dlssnr_f16_increment, 1, 0, dlssnr_f16_round;",
+                "add.u32 dlssnr_f16_subnormal, dlssnr_f16_subnormal, "
+                "dlssnr_f16_increment;",
+                "setp.lt.u32 dlssnr_f16_denormal, dlssnr_f16_abs, 0x2400;",
+                "setp.le.u32 dlssnr_f16_underflow, dlssnr_f16_abs, 0x1400;",
+                "setp.gt.u32 dlssnr_f16_overflow, dlssnr_f16_abs, 0x5f40;",
+                "setp.gt.u32 dlssnr_f16_nan, dlssnr_f16_abs, 0x7c00;",
+                "selp.b32 dlssnr_f16_result, dlssnr_f16_subnormal, "
+                "dlssnr_f16_normal, dlssnr_f16_denormal;",
+                "selp.b32 dlssnr_f16_result, 0, dlssnr_f16_result, "
+                "dlssnr_f16_underflow;",
+                "selp.b32 dlssnr_f16_result, 0x7e, dlssnr_f16_result, "
+                "dlssnr_f16_overflow;",
+                "or.b32 dlssnr_f16_result, dlssnr_f16_result, "
+                "dlssnr_f16_sign;",
+                "selp.b32 dlssnr_f16_result, 0x7f, dlssnr_f16_result, "
+                "dlssnr_f16_nan;",
+            ]
+        )
+        if bit_offset == 0:
+            lines.append("mov.b32 dlssnr_f16_low, dlssnr_f16_result;")
+        else:
+            lines.extend(
+                [
+                    "shl.b32 dlssnr_f16_result, dlssnr_f16_result, 8;",
+                    "or.b32 dlssnr_f16_result, dlssnr_f16_low, "
+                    "dlssnr_f16_result;",
+                    f"cvt.u16.u32 {destination}, dlssnr_f16_result;",
+                ]
+            )
+    return lines
+
+
+def fp8_conversion_declarations() -> list[str]:
+    return [
+        ".reg .b32 dlssnr_fp8_value, dlssnr_fp8_abs, dlssnr_fp8_sign;",
+        ".reg .b32 dlssnr_fp8_normal, dlssnr_fp8_mantissa;",
+        ".reg .b32 dlssnr_fp8_msb, dlssnr_fp8_shift, dlssnr_fp8_exponent;",
+        ".reg .b32 dlssnr_fp8_subnormal, dlssnr_fp8_result, dlssnr_fp8_low;",
+        ".reg .pred dlssnr_fp8_exp_zero, dlssnr_fp8_zero, dlssnr_fp8_nan;",
+    ]
+
+
+def half_conversion_declarations() -> list[str]:
+    return [
+        ".reg .b32 dlssnr_f16_source, dlssnr_f16_value, dlssnr_f16_abs;",
+        ".reg .b32 dlssnr_f16_sign, dlssnr_f16_normal, dlssnr_f16_remainder;",
+        ".reg .b32 dlssnr_f16_lsb, dlssnr_f16_increment, dlssnr_f16_exponent;",
+        ".reg .b32 dlssnr_f16_mantissa, dlssnr_f16_shift, dlssnr_f16_scale;",
+        ".reg .b32 dlssnr_f16_mask, dlssnr_f16_half, dlssnr_f16_subnormal;",
+        ".reg .b32 dlssnr_f16_result, dlssnr_f16_low;",
+        ".reg .pred dlssnr_f16_gt, dlssnr_f16_eq, dlssnr_f16_odd;",
+        ".reg .pred dlssnr_f16_tie, dlssnr_f16_round;",
+        ".reg .pred dlssnr_f16_denormal, dlssnr_f16_underflow;",
+        ".reg .pred dlssnr_f16_overflow, dlssnr_f16_nan;",
+    ]
+
+
+def fp8_pack_sources(text: str) -> dict[str, tuple[str, str, int]]:
+    down_sources: dict[str, list[str]] = {}
+    for match in FP8_DOWN_PATTERN.finditer(text):
+        down_sources.setdefault(match.group("destination"), []).append(
+            match.group("source")
+        )
+
+    packed_sources: dict[str, list[tuple[str, str, int]]] = {}
+    for match in FP8_PACK_PATTERN.finditer(text):
+        low_sources = down_sources.get(match.group("low"), [])
+        high_sources = down_sources.get(match.group("high"), [])
+        if len(low_sources) == len(high_sources) == 1:
+            packed_sources.setdefault(match.group("destination"), []).append(
+                (low_sources[0], high_sources[0], match.start())
+            )
+    return {
+        register: sources[0]
+        for register, sources in packed_sources.items()
+        if len(sources) == 1
+    }
+
+
+def render_fp8_mma_run(
+    matches: Sequence[re.Match[str]],
+    packed_sources: dict[str, tuple[str, str, int]],
+) -> str:
+    operands: list[str] = []
+    for match in matches:
+        for name in ("a0", "a1", "a2", "a3", "b0", "b1"):
+            register = match.group(name)
+            if register not in operands:
+                operands.append(register)
+    names = {
+        register: (f"dlssnr_fp16_{index}_0", f"dlssnr_fp16_{index}_1")
+        for index, register in enumerate(operands)
+    }
+    mapped = {
+        register: sources
+        for register, sources in packed_sources.items()
+        if sources[2] < matches[0].start()
+    }
+    # FP8 k32 and FP16 k16 distribute each fragment differently across a
+    # four-lane group. Each source register becomes two shuffled FP16 pairs;
+    # two k16 operations then cover the original k32 accumulation.
+    has_encoded_operands = any(register not in mapped for register in operands)
+
+    lines = ["{"]
+    lines.extend(
+        [
+            ".reg .u32 dlssnr_lane, dlssnr_group, dlssnr_pair;",
+            ".reg .u32 dlssnr_source0, dlssnr_source1, dlssnr_parity;",
+            ".reg .b32 dlssnr_shuffle0, dlssnr_shuffle1, dlssnr_shifted;",
+            ".reg .b32 dlssnr_selected;",
+            ".reg .pred dlssnr_high;",
+            ".reg .b32 "
+            + ", ".join(name for pair in names.values() for name in pair)
+            + ";",
+        ]
+    )
+    if has_encoded_operands:
+        lines.extend(fp8_conversion_declarations())
+    lines.extend(
+        [
+            "mov.u32 dlssnr_lane, %laneid;",
+            "and.b32 dlssnr_group, dlssnr_lane, 0x1c;",
+            "shr.u32 dlssnr_pair, dlssnr_lane, 1;",
+            "and.b32 dlssnr_pair, dlssnr_pair, 1;",
+            "add.u32 dlssnr_source0, dlssnr_group, dlssnr_pair;",
+            "add.u32 dlssnr_source1, dlssnr_source0, 2;",
+            "and.b32 dlssnr_parity, dlssnr_lane, 1;",
+            "setp.ne.u32 dlssnr_high, dlssnr_parity, 0;",
+        ]
+    )
+
+    for register in operands:
+        first, second = names[register]
+        if register in mapped:
+            low, high, _position = mapped[register]
+            for source_index, destination in (
+                ("dlssnr_source0", first),
+                ("dlssnr_source1", second),
+            ):
+                lines.extend(
+                    [
+                        "shfl.sync.idx.b32 dlssnr_shuffle0, "
+                        f"{low}, {source_index}, 0x1f, 0xffffffff;",
+                        "shfl.sync.idx.b32 dlssnr_shuffle1, "
+                        f"{high}, {source_index}, 0x1f, 0xffffffff;",
+                        f"selp.b32 {destination}, dlssnr_shuffle1, "
+                        "dlssnr_shuffle0, dlssnr_high;",
+                    ]
+                )
+        else:
+            for source_index, destination in (
+                ("dlssnr_source0", first),
+                ("dlssnr_source1", second),
+            ):
+                lines.extend(
+                    [
+                        "shfl.sync.idx.b32 dlssnr_shuffle0, "
+                        f"{register}, {source_index}, 0x1f, 0xffffffff;",
+                        "shr.u32 dlssnr_shifted, dlssnr_shuffle0, 16;",
+                        "selp.b32 dlssnr_selected, dlssnr_shifted, "
+                        "dlssnr_shuffle0, dlssnr_high;",
+                    ]
+                )
+                lines.extend(fp8_pair_to_half_lines("dlssnr_selected", destination))
+
+    for match in matches:
+        d0, d1 = match.group("d0"), match.group("d1")
+        c0, c1 = match.group("c0"), match.group("c1")
+        a0, a1 = names[match.group("a0")]
+        a2, a3 = names[match.group("a1")]
+        a4, a5 = names[match.group("a2")]
+        a6, a7 = names[match.group("a3")]
+        b0, b1 = names[match.group("b0")]
+        b2, b3 = names[match.group("b1")]
+        lines.extend(
+            [
+                "mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 "
+                f"{{{d0}, {d1}}}, {{{a0}, {a2}, {a1}, {a3}}}, "
+                f"{{{b0}, {b1}}}, {{{c0}, {c1}}};",
+                "mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 "
+                f"{{{d0}, {d1}}}, {{{a4}, {a6}, {a5}, {a7}}}, "
+                f"{{{b2}, {b3}}}, {{{d0}, {d1}}};",
+            ]
+        )
+    lines.append("}")
+    return "\n".join(lines)
+
+
+def lower_fp8_mma_entry(text: str) -> tuple[str, int]:
+    matches = list(FP8_MMA_PATTERN.finditer(text))
+    if not matches:
+        return text, 0
+    runs: list[list[re.Match[str]]] = [[matches[0]]]
+    for match in matches[1:]:
+        if text[runs[-1][-1].end() : match.start()].strip():
+            runs.append([match])
+        else:
+            runs[-1].append(match)
+
+    packed_sources = fp8_pack_sources(text)
+    replacements = [
+        (
+            run[0].start(),
+            run[-1].end(),
+            render_fp8_mma_run(run, packed_sources),
+        )
+        for run in runs
+    ]
+    for start, end, replacement in reversed(replacements):
+        text = text[:start] + replacement + text[end:]
+
+    text = FP8_PACK_PATTERN.sub(
+        lambda match: ""
+        if ptx_register_count(text, match.group("destination")) == 1
+        else match.group(0),
+        text,
+    )
+    text = FP8_DOWN_PATTERN.sub(
+        lambda match: ""
+        if ptx_register_count(text, match.group("destination")) == 1
+        else match.group(0),
+        text,
+    )
+    return text, len(matches)
+
+
+def lower_fp8_mma(text: str) -> tuple[str, int]:
+    starts = [match.start() for match in PTX_ENTRY_PATTERN.finditer(text)]
+    if not starts:
+        return lower_fp8_mma_entry(text)
+    boundaries = [0, *starts, len(text)]
+    parts: list[str] = []
+    count = 0
+    for start, end in zip(boundaries, boundaries[1:]):
+        part, part_count = lower_fp8_mma_entry(text[start:end])
+        parts.append(part)
+        count += part_count
+    return "".join(parts), count
+
+
+def lower_fp8_conversions(text: str, stats: TransformStats) -> str:
+    generic_down_count = len(
+        re.findall(r"\bcvt\.[^;\n]*\.e4m3x2\.f16x2\b", text)
+    )
+    generic_up_count = len(
+        re.findall(r"\bcvt\.[^;\n]*\.f16x2\.e4m3x2\b", text)
+    )
+    down_count = len(FP8_DOWN_PATTERN.findall(text))
+    up_count = len(FP8_UP_PATTERN.findall(text))
+    if down_count != generic_down_count:
+        raise PatchError("An FP16-to-FP8 conversion has an unsupported form.")
+    if up_count != generic_up_count:
+        raise PatchError("An FP8-to-FP16 conversion has an unsupported form.")
+
+    def replace_down(match: re.Match[str]) -> str:
+        lines = ["{", *half_conversion_declarations()]
+        lines.extend(
+            half_pair_to_fp8_lines(
+                match.group("source"), match.group("destination")
+            )
+        )
+        lines.append("}")
+        return "\n".join(lines)
+
+    def replace_up(match: re.Match[str]) -> str:
+        lines = ["{", ".reg .b32 dlssnr_fp8_source;"]
+        lines.extend(fp8_conversion_declarations())
+        lines.append(
+            f"cvt.u32.u16 dlssnr_fp8_source, {match.group('source')};"
+        )
+        lines.extend(
+            fp8_pair_to_half_lines(
+                "dlssnr_fp8_source", match.group("destination")
+            )
+        )
+        lines.append("}")
+        return "\n".join(lines)
+
+    text, down_count = FP8_DOWN_PATTERN.subn(replace_down, text)
+    text, up_count = FP8_UP_PATTERN.subn(replace_up, text)
+    stats.add("fp16_to_fp8", down_count)
+    stats.add("fp8_to_fp16", up_count)
+    return text
+
+
+def lower_fp8_operations(text: str, stats: TransformStats) -> str:
+    # Pre-Ada GPUs execute the source E4M3 path through integer conversions and
+    # FP16 MMAs, so results and performance can differ from native FP8.
+    generic_mma_count = len(
+        re.findall(
+            r"\bmma\.[^;]*\.f16\.e4m3\.e4m3\.f16\b", text, re.DOTALL
+        )
+    )
+    mma_matches = list(FP8_MMA_PATTERN.finditer(text))
+    if len(mma_matches) != generic_mma_count:
+        raise PatchError("An FP8 matrix operation has an unsupported form.")
+    if any(match.group("guard") for match in mma_matches):
+        raise PatchError("A predicated FP8 matrix operation is unsupported.")
+    if any(match.group("guard") for match in FP8_DOWN_PATTERN.finditer(text)):
+        raise PatchError("A predicated FP16-to-FP8 conversion is unsupported.")
+    if any(match.group("guard") for match in FP8_UP_PATTERN.finditer(text)):
+        raise PatchError("A predicated FP8-to-FP16 conversion is unsupported.")
+    if any(match.group("guard") for match in FP8_PACK_PATTERN.finditer(text)):
+        raise PatchError("A predicated FP8 pack operation is unsupported.")
+    text, mma_count = lower_fp8_mma(text)
+    stats.add("fp8_mma", mma_count)
+    return lower_fp8_conversions(text, stats)
+
+
+F16_MMA_REGISTER = r"(?:%r\d+|dlssnr_fp16_\d+_[01])"
+F16_MMA_PATTERN = re.compile(
+    rf"(?P<guard>@!?{PTX_PREDICATE}\s+)?"
+    r"mma\.sync\.aligned\.m16n8k16\.row\.col\.f16\.f16\.f16\.f16\s*"
+    r"\{\s*(?P<d0>%r\d+),\s*(?P<d1>%r\d+)\s*\}\s*,\s*"
+    rf"\{{\s*(?P<a0>{F16_MMA_REGISTER}),\s*"
+    rf"(?P<a1>{F16_MMA_REGISTER}),\s*"
+    rf"(?P<a2>{F16_MMA_REGISTER}),\s*"
+    rf"(?P<a3>{F16_MMA_REGISTER})\s*\}}\s*,\s*"
+    rf"\{{\s*(?P<b0>{F16_MMA_REGISTER}),\s*"
+    rf"(?P<b1>{F16_MMA_REGISTER})\s*\}}\s*,\s*"
+    r"\{\s*(?P<c0>%r\d+),\s*(?P<c1>%r\d+)\s*\}\s*;"
+)
+F16_MIN_MAX_PATTERN = re.compile(
+    rf"(?P<guard>@!?{PTX_PREDICATE}\s+)?"
+    r"(?P<operation>min|max)\.f16x2\s+"
+    r"(?P<destination>%r\d+),\s*(?P<first>%r\d+),\s*"
+    r"(?P<second>%r\d+)\s*;"
+)
+SIMPLE_ASYNC_COPY_PATTERN = re.compile(
+    rf"(?P<guard>@!?{PTX_PREDICATE}\s+)?"
+    r"cp\.async\.(?P<cache>ca|cg)\.shared\.global\s+"
+    r"\[(?P<destination>%r\d+)\],\s*\[(?P<source>%rd\d+)\],\s*"
+    r"(?P<size>4|8|16)\s*;"
+)
+ASYNC_COMMIT_PATTERN = re.compile(
+    rf"(?P<guard>@!?{PTX_PREDICATE}\s+)?cp\.async\.commit_group\s*;"
+)
+ASYNC_WAIT_PATTERN = re.compile(
+    rf"(?P<guard>@!?{PTX_PREDICATE}\s+)?cp\.async\.wait_group\s+0\s*;"
+)
+MBARRIER_INIT_PATTERN = re.compile(
+    rf"(?P<guard>@!?{PTX_PREDICATE}\s+)?"
+    r"mbarrier\.init\.shared\.b64\s+"
+    r"\[(?P<storage>%r\d+)\],\s*(?P<count>%r\d+)\s*;"
+)
+MBARRIER_ARRIVE_PATTERN = re.compile(
+    rf"(?P<guard>@!?{PTX_PREDICATE}\s+)?"
+    r"mbarrier\.arrive\.shared::cta\.b64\s+"
+    r"(?P<state>%rd\d+),\s*\[(?P<storage>%r\d+)\]\s*;"
+)
+MBARRIER_WAIT_PATTERN = re.compile(
+    rf"(?P<guard>@!?{PTX_PREDICATE}\s+)?"
+    r"mbarrier\.test_wait\.shared::cta\.b64\s+"
+    rf"(?P<result>{PTX_PREDICATE}),\s*"
+    r"\[(?P<storage>%r\d+)\],\s*(?P<state>%rd\d+)\s*;"
+)
+
+
+def lower_turing_mma(text: str, stats: TransformStats) -> str:
+    generic_count = len(
+        re.findall(
+            r"\bmma\.[^;]*\.m16n8k16\.[^;]*\.f16\.f16\.f16\.f16\b",
+            text,
+            re.DOTALL,
+        )
+    )
+    matches = list(F16_MMA_PATTERN.finditer(text))
+    if len(matches) != generic_count:
+        raise PatchError("An FP16 matrix operation has an unsupported form.")
+    if any(match.group("guard") for match in matches):
+        raise PatchError("A predicated FP16 matrix operation is unsupported for Turing.")
+
+    def replace(match: re.Match[str]) -> str:
+        d0, d1 = match.group("d0"), match.group("d1")
+        c0, c1 = match.group("c0"), match.group("c1")
+        return "\n".join(
+            [
+                "mma.sync.aligned.m16n8k8.row.col.f16.f16.f16.f16 "
+                f"{{{d0}, {d1}}}, "
+                f"{{{match.group('a0')}, {match.group('a1')}}}, "
+                f"{{{match.group('b0')}}}, {{{c0}, {c1}}};",
+                "mma.sync.aligned.m16n8k8.row.col.f16.f16.f16.f16 "
+                f"{{{d0}, {d1}}}, "
+                f"{{{match.group('a2')}, {match.group('a3')}}}, "
+                f"{{{match.group('b1')}}}, {{{d0}, {d1}}};",
+            ]
+        )
+
+    text, count = F16_MMA_PATTERN.subn(replace, text)
+    stats.add("mma_k16", count)
+    return text
+
+
+def lower_turing_half_min_max(text: str, stats: TransformStats) -> str:
+    generic_count = len(re.findall(r"\b(?:min|max)\.f16(?:x2)?\b", text))
+    matches = list(F16_MIN_MAX_PATTERN.finditer(text))
+    if len(matches) != generic_count:
+        raise PatchError("A half-precision minimum or maximum has an unsupported form.")
+    if any(match.group("guard") for match in matches):
+        raise PatchError(
+            "A predicated half-precision minimum or maximum is unsupported for Turing."
+        )
+
+    def replace(match: re.Match[str]) -> str:
+        operation = match.group("operation")
+        lines = [
+            "{",
+            ".reg .b16 dlssnr_half_a0, dlssnr_half_a1;",
+            ".reg .b16 dlssnr_half_b0, dlssnr_half_b1;",
+            ".reg .b16 dlssnr_half_d0, dlssnr_half_d1;",
+            ".reg .f32 dlssnr_half_a, dlssnr_half_b, dlssnr_half_result;",
+            f"mov.b32 {{dlssnr_half_a0, dlssnr_half_a1}}, "
+            f"{match.group('first')};",
+            f"mov.b32 {{dlssnr_half_b0, dlssnr_half_b1}}, "
+            f"{match.group('second')};",
+        ]
+        for suffix in ("0", "1"):
+            lines.extend(
+                [
+                    f"cvt.f32.f16 dlssnr_half_a, dlssnr_half_a{suffix};",
+                    f"cvt.f32.f16 dlssnr_half_b, dlssnr_half_b{suffix};",
+                    f"{operation}.f32 dlssnr_half_result, "
+                    "dlssnr_half_a, dlssnr_half_b;",
+                    f"cvt.rn.f16.f32 dlssnr_half_d{suffix}, "
+                    "dlssnr_half_result;",
+                ]
+            )
+        lines.extend(
+            [
+                f"mov.b32 {match.group('destination')}, "
+                "{dlssnr_half_d0, dlssnr_half_d1};",
+                "}",
+            ]
+        )
+        return "\n".join(lines)
+
+    operation_counts = {
+        operation: len(
+            re.findall(rf"\b{operation}\.f16x2\b", text)
+        )
+        for operation in ("min", "max")
+    }
+    text = F16_MIN_MAX_PATTERN.sub(replace, text)
+    for operation, count in operation_counts.items():
+        stats.add(f"half_{operation}", count)
+    return text
+
+
+def lower_turing_async_copies(text: str, stats: TransformStats) -> str:
+    generic_count = len(re.findall(r"\bcp\.async(?:\.[^;\n]*)?\s*[^;\n]*;", text))
+    copy_matches = list(SIMPLE_ASYNC_COPY_PATTERN.finditer(text))
+    commit_matches = list(ASYNC_COMMIT_PATTERN.finditer(text))
+    wait_matches = list(ASYNC_WAIT_PATTERN.finditer(text))
+    copy_count = len(copy_matches)
+    commit_count = len(commit_matches)
+    wait_count = len(wait_matches)
+    if copy_count + commit_count + wait_count != generic_count:
+        raise PatchError("An asynchronous copy has an unsupported form for Turing.")
+    if any(
+        match.group("guard")
+        for matches in (copy_matches, commit_matches, wait_matches)
+        for match in matches
+    ):
+        raise PatchError("A predicated asynchronous copy is unsupported for Turing.")
+    if commit_count != wait_count:
+        raise PatchError("Turing asynchronous copy groups are not paired.")
+
+    def replace(match: re.Match[str]) -> str:
+        size = int(match.group("size"))
+        register_count = size // 4
+        registers = [f"dlssnr_copy{index}" for index in range(register_count)]
+        if register_count == 1:
+            register_type = ".b32"
+            operand = registers[0]
+        else:
+            register_type = f".v{register_count}.b32"
+            operand = "{" + ", ".join(registers) + "}"
+        return "\n".join(
+            [
+                "{",
+                ".reg .b32 " + ", ".join(registers) + ";",
+                f"ld.global.{match.group('cache')}{register_type} {operand}, "
+                f"[{match.group('source')}];",
+                f"st.shared{register_type} [{match.group('destination')}], "
+                f"{operand};",
+                "}",
+            ]
+        )
+
+    text, count = SIMPLE_ASYNC_COPY_PATTERN.subn(replace, text)
+    text = ASYNC_COMMIT_PATTERN.sub("", text)
+    text = ASYNC_WAIT_PATTERN.sub("", text)
+    stats.add("async_copy", count)
+    stats.add("async_group", commit_count)
+    return text
+
+
+def lower_turing_mbarriers(text: str, stats: TransformStats) -> str:
+    generic_count = len(re.findall(r"\bmbarrier\.[^;\n]+;", text))
+    init_matches = list(MBARRIER_INIT_PATTERN.finditer(text))
+    arrive_matches = list(MBARRIER_ARRIVE_PATTERN.finditer(text))
+    wait_matches = list(MBARRIER_WAIT_PATTERN.finditer(text))
+    init_count = len(init_matches)
+    arrive_count = len(arrive_matches)
+    wait_count = len(wait_matches)
+    if init_count + arrive_count + wait_count != generic_count:
+        raise PatchError("An mbarrier operation has an unsupported form for Turing.")
+    if any(
+        match.group("guard")
+        for matches in (init_matches, arrive_matches, wait_matches)
+        for match in matches
+    ):
+        raise PatchError("A predicated mbarrier operation is unsupported for Turing.")
+    if arrive_count != wait_count:
+        raise PatchError("Turing mbarrier arrivals and waits are not paired.")
+
+    # A full-CTA barrier is equivalent only when the source mbarrier expects one
+    # arrival from every thread in the block.
+    for match in init_matches:
+        start = max(0, match.start() - 2000)
+        prefix = text[start : match.start()]
+        count_register = match.group("count")
+        multiply_pattern = re.compile(
+            r"mul\.lo\.s32\s+"
+            + re.escape(count_register)
+            + r",\s*(%r\d+),\s*(%r\d+)\s*;"
+        )
+        multiply_matches = list(multiply_pattern.finditer(prefix))
+        if not multiply_matches:
+            raise PatchError("A Turing mbarrier does not count all block threads.")
+        multiply = multiply_matches[-1]
+        dimensions = []
+        for register in multiply.groups():
+            assignment_pattern = re.compile(
+                r"mov\.u32\s+"
+                + re.escape(register)
+                + r",\s*(%ntid\.[xyz])\s*;"
+            )
+            assignments = list(
+                assignment_pattern.finditer(prefix, 0, multiply.start())
+            )
+            if not assignments:
+                raise PatchError("A Turing mbarrier has an unknown arrival count.")
+            dimensions.append(assignments[-1].group(1))
+        if dimensions != ["%ntid.x", "%ntid.y"]:
+            raise PatchError("A Turing mbarrier does not count all block threads.")
+
+    text = MBARRIER_INIT_PATTERN.sub("", text)
+    text = MBARRIER_ARRIVE_PATTERN.sub("bar.sync 0;", text)
+    text = MBARRIER_WAIT_PATTERN.sub(r"mov.pred \g<result>, 1;", text)
+    stats.add("barrier_init", init_count)
+    stats.add("barrier_sync", arrive_count)
+    return text
+
+
+def lower_turing_operations(text: str, stats: TransformStats) -> str:
+    text = lower_turing_mma(text, stats)
+    text = lower_turing_half_min_max(text, stats)
+    text = lower_turing_async_copies(text, stats)
+    return lower_turing_mbarriers(text, stats)
+
+
+def transform_ptx(
+    source: str, target: Architecture = ADA
+) -> tuple[str, TransformStats]:
     # Keep these conversions narrow. If an instruction has an unknown form,
-    # fail instead of producing PTX that may run incorrectly on Ada.
+    # fail instead of producing PTX that may run incorrectly on the target.
     stats = TransformStats()
 
-    # Recompile the embedded program for Ada. Limit the PTX version before
-    # ptxas sees it; the selected toolchain supports PTX 9.3 for this target.
+    # Limit the PTX version before ptxas sees it; the selected toolchain uses
+    # PTX 9.3 for the pre-Blackwell targets supported by these conversions.
     version_pattern = re.compile(r"(?m)^(\s*\.version\s+)(\d+)\.(\d+)(\s*)$")
     version_matches = list(version_pattern.finditer(source))
     if len(version_matches) != 1:
@@ -620,10 +1352,16 @@ def transform_ptx(source: str) -> tuple[str, TransformStats]:
 
     def replace_version(match: re.Match[str]) -> str:
         version = (int(match.group(2)), int(match.group(3)))
-        if version <= MAX_ADA_PTX_VERSION:
+        if (
+            target.cuda >= BLACKWELL.cuda
+            or version <= MAX_COMPATIBLE_PTX_VERSION
+        ):
             return match.group(0)
         stats.add("ptx_version", 1)
-        return f"{match.group(1)}{MAX_ADA_PTX_VERSION[0]}.{MAX_ADA_PTX_VERSION[1]}{match.group(4)}"
+        return (
+            f"{match.group(1)}{MAX_COMPATIBLE_PTX_VERSION[0]}."
+            f"{MAX_COMPATIBLE_PTX_VERSION[1]}{match.group(4)}"
+        )
 
     output = version_pattern.sub(replace_version, source)
 
@@ -633,20 +1371,31 @@ def transform_ptx(source: str) -> tuple[str, TransformStats]:
         raise PatchError(
             f"Expected one PTX target directive, found {len(target_matches)}."
         )
-    output = target_pattern.sub(rf"\g<1>sm_{TARGET_ARCH}\2", output)
+    output = target_pattern.sub(rf"\g<1>{target.cuda_name}\2", output)
     stats.add("target", 1)
 
-    # Ada has no equivalent for the newer warp bulk-copy instruction. Accept
-    # only ordered elect/copy/expect groups whose barrier operands match.
-    predicate = r"(?:%p\d+|[A-Za-z_][\w$]*)"
-    elect_pattern = re.compile(rf"elect\.sync\s+_\|({predicate}),\s*%r\d+\s*;")
+    if target.cuda >= BLACKWELL.cuda:
+        return output, stats
+    if target.cuda < ADA.cuda:
+        output = lower_fp8_operations(output, stats)
+
+    # Pre-Blackwell targets have no equivalent for the newer warp bulk-copy
+    # instruction. Accept only ordered elect/copy/expect groups whose barrier
+    # operands match.
+    elect_pattern = re.compile(
+        rf"elect\.sync\s+_\|({PTX_PREDICATE}),\s*%r\d+\s*;"
+    )
     bulk_pattern = re.compile(
+        rf"(?P<guard>@!?{PTX_PREDICATE}\s+)?"
         r"cp\.async\.bulk\.shared::cta\.global\.mbarrier::complete_tx::bytes\s+"
-        r"\[(%r\d+)\],\s*\[(%rd\d+)\],\s*(%r\d+),\s*\[(%r\d+)\]\s*;"
+        r"\[(?P<destination>%r\d+)\],\s*"
+        r"\[(?P<source>%rd\d+)\],\s*(?P<size>%r\d+),\s*"
+        r"\[(?P<barrier>%r\d+)\]\s*;"
     )
     expect_pattern = re.compile(
+        rf"(?P<guard>@!?{PTX_PREDICATE}\s+)?"
         r"mbarrier\.expect_tx(?:\.[A-Za-z0-9_:]+)*\s+"
-        r"\[(%r\d+)\],\s*(%r\d+)\s*;"
+        r"\[(?P<barrier>%r\d+)\],\s*(?P<size>%r\d+)\s*;"
     )
     elect_matches = list(elect_pattern.finditer(output))
     bulk_matches = list(bulk_pattern.finditer(output))
@@ -658,8 +1407,12 @@ def transform_ptx(source: str) -> tuple[str, TransformStats]:
         raise PatchError("An elect operation has an unsupported form.")
     if len(bulk_matches) != len(generic_bulks):
         raise PatchError("A bulk-copy operation has an unsupported form.")
+    if any(match.group("guard") for match in bulk_matches):
+        raise PatchError("A predicated bulk-copy operation is unsupported.")
     if len(expect_matches) != len(generic_expects):
         raise PatchError("A transaction expectation has an unsupported form.")
+    if any(match.group("guard") for match in expect_matches):
+        raise PatchError("A predicated transaction expectation is unsupported.")
 
     ordered_copy_operations = sorted(
         [(match.start(), "elect") for match in elect_matches]
@@ -677,7 +1430,10 @@ def transform_ptx(source: str) -> tuple[str, TransformStats]:
     ):
         if elect.group(1) not in output[elect.end() : bulk.start()]:
             raise PatchError("An elected predicate does not control its bulk copy.")
-        if (bulk.group(4), bulk.group(3)) != (expect.group(1), expect.group(2)):
+        if (bulk.group("barrier"), bulk.group("size")) != (
+            expect.group("barrier"),
+            expect.group("size"),
+        ):
             raise PatchError(
                 "A bulk copy and its transaction expectation do not match."
             )
@@ -691,7 +1447,7 @@ def transform_ptx(source: str) -> tuple[str, TransformStats]:
     )
     wait_pattern = re.compile(
         rf"mbarrier\.try_wait\.shared::cta\.b64\s+"
-        rf"({predicate}),\s*\[(%r\d+)\],\s*(%rd\d+)\s*;"
+        rf"({PTX_PREDICATE}),\s*\[(%r\d+)\],\s*(%rd\d+)\s*;"
     )
     arrive_matches = list(arrive_pattern.finditer(output))
     wait_matches = list(wait_pattern.finditer(output))
@@ -722,32 +1478,55 @@ def transform_ptx(source: str) -> tuple[str, TransformStats]:
             raise PatchError(f"Unsupported mbarrier arrival count {count}.")
 
     # The supported 512- and 1024-byte bulk forms become per-lane 16-byte
-    # copies. Each lane waits for its normal async-copy group before arrival.
+    # copies. Targets with asynchronous copies wait for their normal copy group;
+    # Turing uses synchronous vector loads and stores instead.
     def replace_bulk(match: re.Match[str]) -> str:
-        destination, source_address, size_register, _barrier = match.groups()
+        destination = match.group("destination")
+        source_address = match.group("source")
+        size_register = match.group("size")
         copy_size = previous_literal_assignment(output, match.start(), size_register)
         if copy_size not in (512, 1024):
             raise PatchError(f"Unsupported bulk-copy size {copy_size} bytes.")
         copies = []
         for offset in range(0, copy_size, 512):
             suffix = f"+{offset}" if offset else ""
-            copies.append(
-                "cp.async.cg.shared.global "
-                f"[dlss5_address{suffix}], [dlss5_source{suffix}], 16;"
+            if target == TURING:
+                copies.extend(
+                    [
+                        "ld.global.cg.v4.b32 "
+                        "{dlss5_copy0, dlss5_copy1, dlss5_copy2, "
+                        f"dlss5_copy3}}, [dlss5_source{suffix}];",
+                        f"st.shared.v4.b32 [dlss5_address{suffix}], "
+                        "{dlss5_copy0, dlss5_copy1, dlss5_copy2, "
+                        "dlss5_copy3};",
+                    ]
+                )
+            else:
+                copies.append(
+                    "cp.async.cg.shared.global "
+                    f"[dlss5_address{suffix}], [dlss5_source{suffix}], 16;"
+                )
+        declarations = ""
+        completion = "cp.async.commit_group;\ncp.async.wait_group 0;\n"
+        if target == TURING:
+            declarations = (
+                ".reg .b32 dlss5_copy0, dlss5_copy1, dlss5_copy2, "
+                "dlss5_copy3;\n"
             )
+            completion = ""
         operations = "\n".join(copies)
         return (
             "{\n"
             ".reg .u32 dlss5_lane, dlss5_offset, dlss5_address;\n"
             ".reg .u64 dlss5_offset64, dlss5_source;\n"
+            f"{declarations}"
             "mov.u32 dlss5_lane, %laneid;\n"
             "shl.b32 dlss5_offset, dlss5_lane, 4;\n"
             f"add.s32 dlss5_address, {destination}, dlss5_offset;\n"
             "cvt.u64.u32 dlss5_offset64, dlss5_offset;\n"
             f"add.s64 dlss5_source, {source_address}, dlss5_offset64;\n"
             f"{operations}\n"
-            "cp.async.commit_group;\n"
-            "cp.async.wait_group 0;\n"
+            f"{completion}"
             "}"
         )
 
@@ -763,7 +1542,7 @@ def transform_ptx(source: str) -> tuple[str, TransformStats]:
     output, expect_count = expect_pattern.subn("", output)
     stats.add("expect_tx", expect_count)
 
-    # Use Ada's one-arrival and test-wait barrier forms.
+    # Use the pre-Blackwell one-arrival and test-wait barrier forms.
     output, arrive_count = arrive_pattern.subn(
         r"mbarrier.arrive.shared::cta.b64 \1, [\2];", output
     )
@@ -773,15 +1552,22 @@ def transform_ptx(source: str) -> tuple[str, TransformStats]:
     )
     stats.add("barrier_wait", wait_count)
 
-    # Ada does not support the four-value vector reduction. Preserve its four
+    # Older targets do not support the four-value vector reduction. Preserve its
     # values as separate packed-half reductions at adjacent addresses.
     reduction_pattern = re.compile(
-        r"red\.global\.v4\.f16x2\.add\.noftz\s+\[(%rd\d+)\],\s*"
-        r"\{\s*(%r\d+),\s*(%r\d+),\s*(%r\d+),\s*(%r\d+)\s*\}\s*;"
+        rf"(?P<guard>@!?{PTX_PREDICATE}\s+)?"
+        r"red\.global\.v4\.f16x2\.add\.noftz\s+"
+        r"\[(?P<address>%rd\d+)\],\s*"
+        r"\{\s*(?P<value0>%r\d+),\s*(?P<value1>%r\d+),\s*"
+        r"(?P<value2>%r\d+),\s*(?P<value3>%r\d+)\s*\}\s*;"
     )
+    reduction_matches = list(reduction_pattern.finditer(output))
+    if any(match.group("guard") for match in reduction_matches):
+        raise PatchError("A predicated vector reduction is unsupported.")
 
     def replace_reduction(match: re.Match[str]) -> str:
-        address, *values = match.groups()
+        address = match.group("address")
+        values = [match.group(f"value{index}") for index in range(4)]
         lines = []
         for index, value in enumerate(values):
             suffix = f"+{index * 4}" if index else ""
@@ -791,17 +1577,30 @@ def transform_ptx(source: str) -> tuple[str, TransformStats]:
     output, reduction_count = reduction_pattern.subn(replace_reduction, output)
     stats.add("vector_reduction", reduction_count)
 
-    # Use the acquire-release fence accepted by Ada in place of release-only.
+    # Use the acquire-release fence accepted by older targets in place of
+    # release-only.
     fence_count = output.count("fence.release.gpu;")
     output = output.replace("fence.release.gpu;", "fence.acq_rel.gpu;")
     stats.add("release_fence", fence_count)
 
-    # Expand fused signed minimum/ReLU into operations that Ada supports.
-    min_relu_pattern = re.compile(r"min\.relu\.s32\s+(%r\d+),\s*(%r\d+),\s*(%r\d+)\s*;")
+    # Expand fused signed minimum/ReLU into operations older targets support.
+    min_relu_pattern = re.compile(
+        rf"(?P<guard>@!?{PTX_PREDICATE}\s+)?min\.relu\.s32\s+"
+        r"(?P<destination>%r\d+),\s*(?P<first>%r\d+),\s*"
+        r"(?P<second>%r\d+)\s*;"
+    )
+    min_relu_matches = list(min_relu_pattern.finditer(output))
+    if any(match.group("guard") for match in min_relu_matches):
+        raise PatchError("A predicated fused minimum/ReLU is unsupported.")
     output, min_relu_count = min_relu_pattern.subn(
-        r"min.s32 \1, \2, \3;\nmax.s32 \1, \1, 0;", output
+        r"min.s32 \g<destination>, \g<first>, \g<second>;\n"
+        r"max.s32 \g<destination>, \g<destination>, 0;",
+        output,
     )
     stats.add("min_relu", min_relu_count)
+
+    if target == TURING:
+        output = lower_turing_operations(output, stats)
 
     unsupported = (
         "elect.sync",
@@ -812,6 +1611,10 @@ def transform_ptx(source: str) -> tuple[str, TransformStats]:
         "min.relu",
         "fence.release.gpu",
     )
+    if target.cuda < ADA.cuda:
+        unsupported += ("e4m3",)
+    if target == TURING:
+        unsupported += ("m16n8k16", "min.f16", "max.f16", "cp.async", "mbarrier")
     remaining = [token for token in unsupported if token in output]
     if remaining:
         raise PatchError(
@@ -915,6 +1718,7 @@ def patch_minimum_architectures(
     data: bytearray,
     sections: Sequence[PeSection],
     exports: dict[str, int],
+    target_ngx_architecture: int = ADA.ngx,
 ) -> tuple[ArchitectureRequirementPatch, ...]:
     pattern = re.compile(r"^NVSDK_NGX_([A-Z0-9_]+)_GetFeatureRequirements$")
     requirement_exports = sorted(
@@ -937,8 +1741,8 @@ def patch_minimum_architectures(
         (patch.offset, patch.previous_value) for patch in patches
     )
     for offset, previous_value in unique_requirements:
-        if previous_value > TARGET_NGX_ARCH:
-            struct.pack_into("<I", data, offset, TARGET_NGX_ARCH)
+        if previous_value > target_ngx_architecture:
+            struct.pack_into("<I", data, offset, target_ngx_architecture)
     return tuple(patches)
 
 
@@ -946,6 +1750,7 @@ def patch_exported_architecture(
     data: bytearray,
     sections: Sequence[PeSection],
     exports: dict[str, int],
+    target_ngx_architecture: int = ADA.ngx,
 ) -> tuple[int, int] | None:
     name = "NVSDK_NGX_GetGPUArchitecture"
     if name not in exports:
@@ -964,13 +1769,16 @@ def patch_exported_architecture(
             f"{len(candidates)}."
         )
     immediate_offset, previous_value = candidates[0]
-    if previous_value > TARGET_NGX_ARCH:
-        struct.pack_into("<I", data, immediate_offset, TARGET_NGX_ARCH)
+    if previous_value > target_ngx_architecture:
+        struct.pack_into("<I", data, immediate_offset, target_ngx_architecture)
     return immediate_offset, previous_value
 
 
 def patch_architecture_metadata(
-    data: bytearray, *, lower_architecture: bool
+    data: bytearray,
+    *,
+    lower_architecture: bool,
+    target_name: str = ADA.ngx_name,
 ) -> tuple[int, ...]:
     if not lower_architecture:
         return ()
@@ -1012,17 +1820,17 @@ def patch_architecture_metadata(
         value = value.split("\0", 1)[0]
         if not value.startswith("NVSDK_NGX_GPU_Arch_"):
             raise PatchError(f"Unexpected NGX architecture metadata value '{value}'.")
-        if value == TARGET_NGX_ARCH_NAME:
+        if value == target_name:
             continue
-        replacement = (TARGET_NGX_ARCH_NAME + "\0").encode("utf-16le")
+        replacement = (target_name + "\0").encode("utf-16le")
         if len(replacement) > value_size:
             raise PatchError(
-                "The Ada architecture name does not fit the metadata entry."
+                f"The {target_name} value does not fit the metadata entry."
             )
         data[value_offset : value_offset + value_size] = replacement.ljust(
             value_size, b"\0"
         )
-        struct.pack_into("<H", data, header_offset + 2, len(TARGET_NGX_ARCH_NAME) + 1)
+        struct.pack_into("<H", data, header_offset + 2, len(target_name) + 1)
         patched_offsets.append(value_offset)
     return tuple(patched_offsets)
 
@@ -1045,7 +1853,10 @@ def decode_architecture_case_entry(
 
 
 def find_success_target(
-    data: bytes | bytearray, cases_end: int, failure_target: int
+    data: bytes | bytearray,
+    cases_end: int,
+    failure_target: int,
+    target_ngx_architecture: int = ADA.ngx,
 ) -> int | None:
     if not cases_end <= failure_target <= len(data):
         return None
@@ -1054,7 +1865,10 @@ def find_success_target(
     while compare >= 0:
         if compare + 5 <= len(data):
             lower_bound = struct.unpack_from("<I", data, compare + 1)[0]
-            if is_ngx_architecture(lower_bound) and lower_bound <= TARGET_NGX_ARCH:
+            if (
+                is_ngx_architecture(lower_bound)
+                and lower_bound <= target_ngx_architecture
+            ):
                 branch = compare + 5
                 if branch + 2 == failure_target and data[branch] == 0x7D:
                     target = branch + 2 + struct.unpack_from("<b", data, branch + 1)[0]
@@ -1071,32 +1885,35 @@ def find_success_target(
 
 def find_architecture_cases(
     data: bytes | bytearray,
+    target_ngx_architecture: int = ADA.ngx,
 ) -> list[tuple[int, int, int, int]]:
     candidates: list[tuple[int, int, int, int]] = []
     for register in range(8):
         # RSP cannot hold a normal architecture case value.
         if register == 4:
             continue
-        marker = (
-            bytes((0xB8 + register,)) + struct.pack("<I", TARGET_NGX_ARCH) + b"\xeb"
-        )
+        marker = bytes((0xB8 + register,)) + struct.pack(
+            "<I", target_ngx_architecture
+        ) + b"\xeb"
         position = 0
         while True:
-            ada_offset = data.find(marker, position)
-            if ada_offset < 0:
+            target_offset = data.find(marker, position)
+            if target_offset < 0:
                 break
-            position = ada_offset + 1
-            ada_entry = decode_architecture_case_entry(data, ada_offset, register)
-            if ada_entry is None:
+            position = target_offset + 1
+            target_entry = decode_architecture_case_entry(
+                data, target_offset, register
+            )
+            if target_entry is None:
                 continue
-            _ada_value, failure_target = ada_entry
-            start = ada_offset
+            _target_value, failure_target = target_entry
+            start = target_offset
             while True:
                 previous = decode_architecture_case_entry(data, start - 7, register)
                 if previous is None or previous[1] != failure_target:
                     break
                 start -= 7
-            end = ada_offset + 7
+            end = target_offset + 7
             while True:
                 following = decode_architecture_case_entry(data, end, register)
                 if following is None or following[1] != failure_target:
@@ -1110,28 +1927,49 @@ def find_architecture_cases(
             if (
                 len(values) < 4
                 or len(values) != len(set(values))
-                or min(values) >= TARGET_NGX_ARCH
-                or max(values) <= TARGET_NGX_ARCH
+                or min(values) >= target_ngx_architecture
+                or max(values) <= target_ngx_architecture
                 or not end <= failure_target <= end + 64
             ):
                 continue
-            success = find_success_target(data, end, failure_target)
+            success = find_success_target(
+                data, end, failure_target, target_ngx_architecture
+            )
             if success is not None:
-                candidates.append((ada_offset, register, failure_target, success))
+                candidates.append((target_offset, register, failure_target, success))
     candidates = list(dict.fromkeys(candidates))
     if not candidates:
         raise PatchError("Cannot find a supported GPU architecture case table.")
     return candidates
 
 
-def patch_ada_cases(data: bytearray) -> tuple[ArchitectureCasePatch, ...]:
-    candidates = find_architecture_cases(data)
+def patch_architecture_cases(
+    data: bytearray, architectures: Sequence[Architecture]
+) -> tuple[ArchitectureCasePatch, ...]:
+    pending: list[tuple[Architecture, int, int, int]] = []
+    seen_architectures: set[int] = set()
+    for architecture in architectures:
+        if architecture.ngx in seen_architectures:
+            continue
+        seen_architectures.add(architecture.ngx)
+        try:
+            candidates = find_architecture_cases(data, architecture.ngx)
+        except PatchError as error:
+            raise PatchError(
+                f"Cannot find a supported {architecture.name.title()} GPU "
+                "architecture case table."
+            ) from error
+        pending.extend(
+            (architecture, offset, register, success)
+            for offset, register, _failure, success in candidates
+        )
+
     patches: list[ArchitectureCasePatch] = []
-    for ada_offset, register, _failure, success in candidates:
-        # Redirect the Ada entry to the existing success block. Both the short
-        # and near forms keep the replacement seven bytes long.
+    for architecture, offset, register, success in pending:
+        # Redirect the selected entry to the existing success block. Both the
+        # short and near forms keep the replacement seven bytes long.
         xor_modrm = 0xC0 | (register << 3) | register
-        displacement = success - (ada_offset + 7)
+        displacement = success - (offset + 7)
         if -128 <= displacement <= 127:
             replacement = bytes(
                 (0x33, xor_modrm, 0x90, 0x90, 0x90, 0xEB, displacement & 0xFF)
@@ -1141,10 +1979,17 @@ def patch_ada_cases(data: bytearray) -> tuple[ArchitectureCasePatch, ...]:
                 "<i", displacement
             )
         else:
-            raise PatchError("An Ada success target is out of range.")
-        data[ada_offset : ada_offset + 7] = replacement
-        patches.append(ArchitectureCasePatch(ada_offset, success))
+            raise PatchError(
+                f"A {architecture.name.title()} success target is out of range."
+            )
+        data[offset : offset + 7] = replacement
+        patches.append(ArchitectureCasePatch(offset, success, architecture.name))
     return tuple(patches)
+
+
+def patch_ada_cases(data: bytearray) -> tuple[ArchitectureCasePatch, ...]:
+    """Patch Ada case tables for callers that use the former helper."""
+    return patch_architecture_cases(data, (ADA,))
 
 
 def patch_ada_case(data: bytearray) -> tuple[int, int]:
@@ -1157,24 +2002,65 @@ def patch_ada_case(data: bytearray) -> tuple[int, int]:
     return patches[0].offset, patches[0].success_offset
 
 
-def apply_host_patches(data: bytearray) -> HostPatchResult:
+def apply_host_patches(
+    data: bytearray, architectures: Sequence[Architecture] = (ADA,)
+) -> HostPatchResult:
+    if not architectures:
+        raise PatchError("At least one target architecture is required.")
+    minimum_architecture = min(architectures, key=lambda architecture: architecture.ngx)
     sections = read_pe_sections(data)
     exports = read_pe_exports(data, sections)
-    requirements = patch_minimum_architectures(data, sections, exports)
-    architecture_export = patch_exported_architecture(data, sections, exports)
-    lower_architecture = any(
-        patch.previous_value > TARGET_NGX_ARCH for patch in requirements
-    ) or (architecture_export is not None and architecture_export[1] > TARGET_NGX_ARCH)
-    metadata_offsets = patch_architecture_metadata(
-        data, lower_architecture=lower_architecture
+    requirements = patch_minimum_architectures(
+        data, sections, exports, minimum_architecture.ngx
     )
-    ada_cases = patch_ada_cases(data)
+    architecture_export = patch_exported_architecture(
+        data, sections, exports, minimum_architecture.ngx
+    )
+    previous_architectures = [patch.previous_value for patch in requirements]
+    if architecture_export is not None:
+        previous_architectures.append(architecture_export[1])
+    lower_architecture = any(
+        previous > minimum_architecture.ngx for previous in previous_architectures
+    )
+    metadata_offsets = patch_architecture_metadata(
+        data,
+        lower_architecture=lower_architecture,
+        target_name=minimum_architecture.ngx_name,
+    )
+    enabled_architectures = tuple(
+        architecture
+        for architecture in architectures
+        if any(previous > architecture.ngx for previous in previous_architectures)
+    )
+    architecture_cases = (
+        patch_architecture_cases(data, enabled_architectures)
+        if enabled_architectures
+        else ()
+    )
     return HostPatchResult(
         requirements,
-        ada_cases,
+        architecture_cases,
         architecture_export[0] if architecture_export is not None else None,
         metadata_offsets,
     )
+
+
+def normalize_architectures(
+    architectures: Sequence[Architecture] | Architecture,
+) -> tuple[Architecture, ...]:
+    if isinstance(architectures, Architecture):
+        architectures = (architectures,)
+    unique: list[Architecture] = []
+    seen_cuda: set[int] = set()
+    for architecture in architectures:
+        if architecture not in SUPPORTED_ARCHITECTURES:
+            raise PatchError(f"Unsupported target architecture '{architecture.name}'.")
+        if architecture.cuda not in seen_cuda:
+            unique.append(architecture)
+            seen_cuda.add(architecture.cuda)
+    if not unique:
+        raise PatchError("At least one target architecture is required.")
+    return tuple(unique)
 
 
 def repack_fatbin(
@@ -1182,9 +2068,11 @@ def repack_fatbin(
     source_blob: bytes,
     tools: CudaTools,
     root: Path,
-) -> tuple[bytes, TransformStats, int]:
-    # Preserve every source ELF image, normalize source PTX line endings, and
-    # add one compiled Ada image. Repack instead of editing compressed bytes.
+    architectures: Sequence[Architecture] | Architecture = (ADA,),
+) -> tuple[bytes, tuple[ArchitectureBuild, ...]]:
+    # Preserve every source image, normalize source PTX line endings, and add
+    # every selected cubin that is not already present.
+    targets = normalize_architectures(architectures)
     work_dir = root / f"fatbin_{index:02d}"
     work_dir.mkdir(parents=True, exist_ok=False)
     source_path = work_dir / "input.fatbin"
@@ -1195,12 +2083,6 @@ def repack_fatbin(
     if len(ptx_images) != 1:
         raise PatchError(
             f"Fatbin {index} has {len(ptx_images)} PTX images. Exactly one is required."
-        )
-    if any(
-        image.kind == "elf" and image.architecture == TARGET_ARCH for image in images
-    ):
-        raise PatchError(
-            f"Fatbin {index} already contains an sm_{TARGET_ARCH} ELF image."
         )
 
     source_ptx_image = ptx_images[0]
@@ -1219,22 +2101,61 @@ def repack_fatbin(
     ):
         raise PatchError(f"Fatbin {index} has no sm_{source_arch} ELF image.")
 
-    transformed_ptx, stats = transform_ptx(source_ptx)
-    transformed_path = work_dir / "ada.ptx"
-    transformed_path.write_bytes(transformed_ptx.encode("utf-8"))
-    ada_cubin = work_dir / f"ada.sm_{TARGET_ARCH}.cubin"
-    run_tool(
-        [
-            tools.ptxas,
-            f"--gpu-name=sm_{TARGET_ARCH}",
-            transformed_path,
-            "--output-file",
-            ada_cubin,
-        ]
-    )
-    if not ada_cubin.is_file() or ada_cubin.stat().st_size == 0:
-        raise PatchError(
-            f"ptxas did not create the sm_{TARGET_ARCH} cubin for fatbin {index}."
+    elf_images: dict[int, list[Image]] = {}
+    for image in images:
+        if image.kind == "elf":
+            elf_images.setdefault(image.architecture, []).append(image)
+
+    def compile_cubin(
+        target: Architecture,
+        transformed_path: Path,
+        target_cubin: Path,
+        *,
+        compact: bool,
+    ) -> None:
+        # Turing's expanded k8 MMA stream is intentionally repetitive. O1 keeps
+        # that stream compressible enough for the fixed fatbin allocations.
+        ptxas_options = ["--opt-level=1"] if target == TURING or compact else []
+        run_tool(
+            [
+                tools.ptxas,
+                f"--gpu-name={target.cuda_name}",
+                *ptxas_options,
+                transformed_path,
+                "--output-file",
+                target_cubin,
+            ]
+        )
+        if not target_cubin.is_file() or target_cubin.stat().st_size == 0:
+            raise PatchError(
+                f"ptxas did not create the {target.cuda_name} cubin for fatbin "
+                f"{index}."
+            )
+
+    builds: list[ArchitectureBuild] = []
+    generated_images: list[Image] = []
+    generated_paths: dict[int, tuple[Path, Path]] = {}
+    for target in targets:
+        existing = elf_images.get(target.cuda, [])
+        if len(existing) > 1:
+            raise PatchError(
+                f"Fatbin {index} contains multiple {target.cuda_name} ELF images."
+            )
+        if existing:
+            builds.append(
+                ArchitectureBuild(target, existing[0].path.stat().st_size, False)
+            )
+            continue
+
+        transformed_ptx, stats = transform_ptx(source_ptx, target)
+        transformed_path = work_dir / f"{target.name}.ptx"
+        transformed_path.write_bytes(transformed_ptx.encode("utf-8"))
+        target_cubin = work_dir / f"{target.name}.{target.cuda_name}.cubin"
+        compile_cubin(target, transformed_path, target_cubin, compact=False)
+        generated_images.append(Image("elf", target.cuda, target_cubin))
+        generated_paths[target.cuda] = (transformed_path, target_cubin)
+        builds.append(
+            ArchitectureBuild(target, target_cubin.stat().st_size, True, stats)
         )
 
     deterministic_images: list[Image] = []
@@ -1251,25 +2172,47 @@ def repack_fatbin(
         )
 
     output_path = work_dir / "output.fatbin"
-    command: list[os.PathLike[str] | str] = [
-        tools.fatbinary,
-        "--64",
-        "--compress-all",
-        "--create",
-        output_path,
-        f"--image3=kind=elf,sm={TARGET_ARCH},file={ada_cubin}",
-    ]
-    for image in deterministic_images:
-        command.append(
-            f"--image3=kind={image.kind},sm={image.architecture},file={image.path}"
-        )
-    run_tool(command)
-    if not output_path.is_file():
-        raise PatchError(f"fatbinary did not create fatbin {index}.")
-    generated = preserve_record_flags(output_path.read_bytes(), source_blob)
 
-    # Round-trip through cuobjdump and compare payloads. The rebuilt container
-    # must keep each ELF and normalized PTX payload, plus the expected Ada image.
+    def build_fatbin() -> bytes:
+        output_path.unlink(missing_ok=True)
+        command: list[os.PathLike[str] | str] = [
+            tools.fatbinary,
+            "--64",
+            "--compress-all",
+            "--compress-mode=size",
+            "--create",
+            output_path,
+        ]
+        for image in [*generated_images, *deterministic_images]:
+            command.append(
+                f"--image3=kind={image.kind},sm={image.architecture},file={image.path}"
+            )
+        run_tool(command)
+        if not output_path.is_file():
+            raise PatchError(f"fatbinary did not create fatbin {index}.")
+        return preserve_record_flags(output_path.read_bytes(), source_blob)
+
+    generated = build_fatbin()
+    # Keep O3 whenever it fits. If a combined build is too large, progressively
+    # favor compressibility for the generated pre-Blackwell cubins.
+    if len(generated) > len(source_blob):
+        for compact_target in (AMPERE, ADA):
+            paths = generated_paths.get(compact_target.cuda)
+            if paths is None:
+                continue
+            transformed_path, target_cubin = paths
+            compile_cubin(
+                compact_target, transformed_path, target_cubin, compact=True
+            )
+            for build in builds:
+                if build.architecture == compact_target:
+                    build.cubin_size = target_cubin.stat().st_size
+                    break
+            generated = build_fatbin()
+            if len(generated) <= len(source_blob):
+                break
+
+    # Round-trip through cuobjdump and compare every source and generated image.
     verification_path = work_dir / "verified.fatbin"
     verification_path.write_bytes(generated)
     verification_dir = work_dir / "verification"
@@ -1279,12 +2222,11 @@ def repack_fatbin(
     )
 
     expected: dict[tuple[str, int], list[bytes]] = {}
-    for image in images:
+    for image in [*images, *generated_images]:
         payload = image.path.read_bytes()
         if image.kind == "ptx":
             payload = canonical_ptx(payload)
         expected.setdefault((image.kind, image.architecture), []).append(payload)
-    expected.setdefault(("elf", TARGET_ARCH), []).append(ada_cubin.read_bytes())
 
     for image in verified_images:
         key = (image.kind, image.architecture)
@@ -1308,7 +2250,7 @@ def repack_fatbin(
         raise PatchError(
             f"Fatbin {index} lost these CUDA images: {', '.join(missing)}."
         )
-    return generated, stats, ada_cubin.stat().st_size
+    return generated, tuple(builds)
 
 
 def path_exists(path: Path) -> bool:
@@ -1443,7 +2385,9 @@ def patch_file(
     force: bool,
     dry_run: bool,
     work_dir: Path | None,
+    architectures: Sequence[Architecture] | Architecture = SUPPORTED_ARCHITECTURES,
 ) -> None:
+    targets = normalize_architectures(architectures)
     input_path = input_path.resolve()
     if not input_path.is_file():
         raise PatchError(f"Input file does not exist: {input_path}")
@@ -1458,11 +2402,12 @@ def patch_file(
     data = bytearray(source_bytes)
     authenticode = strip_authenticode(data)
     locations = find_fatbins(data)
-    host = apply_host_patches(data)
+    host = apply_host_patches(data, targets)
 
     print(f"Input:  {input_path}")
     print(f"SHA-256: {sha256_bytes(source_bytes)}")
     print(f"CUDA:   {cuda_version(tools.ptxas)}")
+    print("Targets: " + ", ".join(target.cuda_name for target in targets))
     print(f"Fatbins: {len(locations)}")
     if authenticode is None:
         print("Authenticode: no certificate table was present")
@@ -1480,8 +2425,14 @@ def patch_file(
     requirements = ", ".join(
         f"{patch.interface}@0x{patch.offset:x}" for patch in host.requirements
     )
-    ada_cases = ", ".join(f"0x{patch.offset:x}" for patch in host.ada_cases)
-    print(f"Host:    requirements {requirements}; Ada cases {ada_cases}")
+    architecture_cases = ", ".join(
+        f"{patch.architecture}@0x{patch.offset:x}"
+        for patch in host.architecture_cases
+    )
+    print(
+        f"Host:    requirements {requirements}; architecture cases "
+        f"{architecture_cases or 'none'}"
+    )
     host_metadata = []
     if host.architecture_export_offset is not None:
         host_metadata.append(f"export@0x{host.architecture_export_offset:x}")
@@ -1493,7 +2444,8 @@ def patch_file(
 
     temporary_context: tempfile.TemporaryDirectory[str] | None = None
     if work_dir is None:
-        temporary_context = tempfile.TemporaryDirectory(prefix="dlssnr-ada-")
+        label = targets[0].name if len(targets) == 1 else "universal"
+        temporary_context = tempfile.TemporaryDirectory(prefix=f"dlssnr-{label}-")
         build_root = Path(temporary_context.name)
     else:
         build_root = work_dir.resolve()
@@ -1504,12 +2456,12 @@ def patch_file(
                 raise PatchError(f"Work directory is not empty: {build_root}")
         build_root.mkdir(parents=True, exist_ok=True)
 
-    totals = TransformStats()
+    totals = {target.name: TransformStats() for target in targets}
     try:
         for index, location in enumerate(locations):
             source_blob = bytes(data[location.offset : location.offset + location.size])
-            generated, stats, cubin_size = repack_fatbin(
-                index, source_blob, tools, build_root
+            generated, builds = repack_fatbin(
+                index, source_blob, tools, build_root, targets
             )
             if len(generated) > location.size:
                 raise PatchError(
@@ -1521,12 +2473,19 @@ def patch_file(
             data[location.offset : location.offset + location.size] = generated + bytes(
                 location.size - len(generated)
             )
-            for name, count in stats.values.items():
-                totals.add(name, count)
+            summaries = []
+            for build in builds:
+                if build.generated:
+                    for name, count in build.stats.values.items():
+                        totals[build.architecture.name].add(name, count)
+                    detail = f"{build.cubin_size} bytes; {build.stats.summary()}"
+                else:
+                    detail = f"existing {build.cubin_size} bytes"
+                summaries.append(f"{build.architecture.cuda_name} {detail}")
             print(
                 f"[{index + 1:02d}/{len(locations):02d}] "
                 f"0x{location.offset:x}: {location.size} -> {len(generated)} bytes; "
-                f"sm_{TARGET_ARCH} cubin {cubin_size} bytes; {stats.summary()}"
+                + "; ".join(summaries)
             )
     finally:
         if temporary_context is not None:
@@ -1537,7 +2496,12 @@ def patch_file(
     # Update the PE checksum after all file changes, including certificate
     # removal.
     pe_checksum = update_pe_checksum(data)
-    print(f"Transforms: {totals.summary()}")
+    transform_summaries = [
+        f"{target.name}: {totals[target.name].summary()}"
+        for target in targets
+        if totals[target.name].values
+    ]
+    print("Transforms: " + ("; ".join(transform_summaries) or "none"))
     print(f"PE checksum: 0x{pe_checksum:08x}")
     print(f"Output SHA-256: {sha256_bytes(data)}")
     if dry_run:
@@ -1559,15 +2523,63 @@ def patch_file(
     )
 
 
+def selected_architectures(args: argparse.Namespace) -> tuple[Architecture, ...]:
+    selected = tuple(
+        architecture
+        for architecture in SUPPORTED_ARCHITECTURES
+        if getattr(args, architecture.name)
+    )
+    return selected or SUPPORTED_ARCHITECTURES
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Add sm_89 CUDA images and enable Ada in all detected NGX interfaces "
-            "in a user-supplied nvngx_dlssnr.dll."
-        )
+            "Add selected CUDA architectures and enable their NGX paths in a\n"
+            "user-supplied nvngx_dlssnr.dll. All supported RTX generations are\n"
+            "selected when no architecture flags are given."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=r"""examples:
+  Build for every supported RTX generation (default):
+    python %(prog)s "C:\path\to\nvngx_dlssnr.dll"
+
+  Build only the Turing and Ampere targets:
+    python %(prog)s --turing --ampere "C:\path\to\nvngx_dlssnr.dll"
+
+  Compile and verify without writing a file:
+    python %(prog)s --dry-run "C:\path\to\nvngx_dlssnr.dll"
+
+Architecture flags can be combined. Omit all four to build Turing, Ampere,
+Ada, and Blackwell targets together.""",
     )
     parser.add_argument(
         "input", type=Path, help="Path to the original nvngx_dlssnr.dll"
+    )
+    architecture_group = parser.add_argument_group("target architectures")
+    architecture_group.add_argument(
+        "-t",
+        "--turing",
+        action="store_true",
+        help="Include Turing / RTX 20 Series (sm_75)",
+    )
+    architecture_group.add_argument(
+        "-A",
+        "--ampere",
+        action="store_true",
+        help="Include Ampere / RTX 30 Series (sm_86)",
+    )
+    architecture_group.add_argument(
+        "-a",
+        "--ada",
+        action="store_true",
+        help="Include Ada / RTX 40 Series (sm_89)",
+    )
+    architecture_group.add_argument(
+        "-b",
+        "--blackwell",
+        action="store_true",
+        help="Include Blackwell / RTX 50 Series (sm_120)",
     )
     parser.add_argument(
         "-o",
@@ -1600,7 +2612,12 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
-    args = parser.parse_args(argv)
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    if not arguments:
+        parser.print_help(sys.stderr)
+        print("\nerror: an input DLL path is required.", file=sys.stderr)
+        return 2
+    args = parser.parse_args(arguments)
     try:
         tools = find_cuda_tools(args.cuda_bin)
         patch_file(
@@ -1610,6 +2627,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             force=args.force,
             dry_run=args.dry_run,
             work_dir=args.work_dir,
+            architectures=selected_architectures(args),
         )
     except PatchError as error:
         print(f"error: {error}", file=sys.stderr)

@@ -2,16 +2,18 @@
 
 ## Project Overview
 
-- This is a Python 3.10+ CLI patcher that adds Ada (`sm_89`) CUDA images and
-  enables Ada architecture paths in a user-supplied `nvngx_dlssnr.dll`.
-- `dlssnr_ada_patcher.py` contains the CLI and all PE parsing, CUDA fatbin
-  handling, PTX transformation, host patching, verification, and output logic.
+- This is a Python 3.10+ CLI patcher that ensures selected Turing (`sm_75`),
+  Ampere (`sm_86`), Ada (`sm_89`), and Blackwell (`sm_120`) CUDA images are
+  present and enables their architecture paths in a user-supplied
+  `nvngx_dlssnr.dll`.
+- `dlssnr_patcher.py` contains the CLI and all PE parsing, CUDA fatbin handling,
+  PTX transformation, host patching, verification, and output logic.
 - `tests/test_patcher.py` contains `unittest` coverage built from synthetic
   PE/fatbin bytes, temporary directories, and mocks. `tests/__init__.py` marks
   the test package.
 - The implementation and tests use only the Python standard library. There is
-  no package manifest, build step, CI workflow, formatter, linter, or
-  type-checker configuration in the repository.
+  no package manifest, build step, formatter, linter, or type-checker
+  configuration. GitHub Actions runs the unit suite and CLI help smoke test.
 
 ## Validation Commands
 
@@ -22,7 +24,7 @@ Run commands from the repository root.
   `python -m unittest tests.test_patcher.PtxTests`.
 - Run one test with
   `python -m unittest tests.test_patcher.PtxTests.test_transform_supported_operations`.
-- Smoke-test argument parsing with `python dlssnr_ada_patcher.py --help`.
+- Smoke-test argument parsing with `python dlssnr_patcher.py --help`.
 - Run targeted tests first while iterating, then run the full suite before
   finishing a code change. Do not claim lint, format, type-check, or CI results;
   none of those checks is configured.
@@ -40,8 +42,8 @@ real patcher run requires CUDA Toolkit 13.3 with `ptxas`, `fatbinary`, and
   rebuild and round-trip-check every fatbin, ensure each rebuilt container fits
   its original allocation, update the PE checksum, and only then write output.
 - Preserve source ELF images and source PTX content during fatbin repacking,
-  allowing only the intentional line-ending normalization. The generated Ada
-  cubin is additive, and unused fatbin space is padded so later PE offsets do
+  allowing only the intentional line-ending normalization. Generated target
+  cubins are additive, and unused fatbin space is padded so later PE offsets do
   not move.
 - Keep PTX transformations narrow. Add success and rejection tests for every
   newly supported instruction shape; do not silently accept an unknown form.

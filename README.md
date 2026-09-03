@@ -1,42 +1,80 @@
-# DLSS Neural Rendering Ada Patcher
+# DLSS Neural Rendering Patcher
 
-Patch to enable DLSS Neural Rendering on an NVIDIA Ada GPU, such as an RTX 40
-Series card.
+DLSS Neural Rendering Patcher is a command-line tool that prepares your copy
+of `nvngx_dlssnr.dll` for NVIDIA GeForce RTX 20, 30, and 40 Series GPUs.
 
-This patcher takes a copy of `nvngx_dlssnr.dll` that you already have and adds
-Ada support. It does not include, download, or distribute NVIDIA DLLs or model
-data.
+The patcher checks its work before writing the patched file. It does not
+include, download, or distribute NVIDIA DLLs or model files.
 
-> **Important:** This changes a proprietary game file and could be detected by
-> anti-cheat systems. Do not use the patched DLL with online, competitive, or
-> anti-cheat-protected games. File-integrity systems can block the game, and
-> anti-cheat systems can take account action, including a ban.
+> **Safety warning:** Patching changes the DLL and invalidates its NVIDIA
+> digital signature. Anti-cheat or file-integrity systems may flag the modified
+> file. Do not use it with online, competitive, or anti-cheat-protected
+> software.
 
-## What you need
+## Requirements
 
-- Python 3.10 or later.
-- CUDA Toolkit 13.3, with `ptxas`, `fatbinary`, and `cuobjdump` available.
-- An original copy of `nvngx_dlssnr.dll`
+- [Python 3.10 or newer](https://www.python.org/downloads/)
+- [CUDA Toolkit 13.3](https://developer.nvidia.com/cuda-downloads)
+  - **Windows:** If the CUDA installer reports that Visual Studio is missing,
+    you can ignore the message and continue the installation. Visual Studio is
+    not required to run this patcher.
+  - The CUDA tools `ptxas`, `fatbinary`, and `cuobjdump` must be available on
+    your system's `PATH`. If the patcher cannot find them, use `--cuda-bin` to
+    point it to the CUDA Toolkit's `bin` folder.
+- Your own original copy of `nvngx_dlssnr.dll`
 
-## Quick start
+## Basic use
 
-1. Open a terminal in this project directory.
-2. Run the patcher with the path to the original DLL:
+1. Download this repository as a ZIP file and extract it.
+2. Find your original `nvngx_dlssnr.dll` and save a separate copy somewhere
+   safe.
+3. Open Command Prompt, PowerShell, or a terminal in the patcher's folder.
+4. Run:
 
    ```text
-   python dlssnr_ada_patcher.py "C:\path\to\nvngx_dlssnr.dll"
+   python dlssnr_patcher.py "C:\path\to\nvngx_dlssnr.dll"
    ```
 
-The patcher compiles and checks every change before it writes a file.
-It renames the original file to `nvngx_dlssnr.dll.bak` and installs
-the patched file under the original name.
+Replace the example path with the full path to your DLL. Keep the quotation
+marks, especially if the path contains spaces.
+
+With no GPU options, the patcher includes every supported generation. If you
+are unsure which option to use, run the basic command above.
+
+## Choosing GPU generations
+
+To select specific GPU generations instead of all four, add one or more of
+these options:
+
+| GeForce family | GPU generation | Option |
+| --- | --- | --- |
+| RTX 20 Series | Turing | `-t`, `--turing` |
+| RTX 30 Series | Ampere | `-A`, `--ampere` |
+| RTX 40 Series | Ada | `-a`, `--ada` |
+| RTX 50 Series | Blackwell | `-b`, `--blackwell` |
+
+Options can be combined. For example, this command selects Turing and Ampere:
+
+```text
+python dlssnr_patcher.py --turing --ampere "C:\path\to\nvngx_dlssnr.dll"
+```
+
+## Output and backups
+
+By default, the patcher renames the original file to
+`nvngx_dlssnr.dll.bak`, then saves the patched file as `nvngx_dlssnr.dll`. It
+will not overwrite an existing backup.
+
+Use `--output patched.dll` to keep the input file unchanged. Use `--dry-run`
+to check the DLL and compile the changes without writing an output file.
+
+Run `python dlssnr_patcher.py --help` to see every option.
 
 ## Contributing
 
-Bug reports and pull requests are welcome. Read [CONTRIBUTING.md](CONTRIBUTING.md)
-before getting started.
+Bug reports and focused pull requests are welcome. Read
+[CONTRIBUTING.md](CONTRIBUTING.md) before getting started.
 
 ## License
 
-This project is licensed under the GNU General Public License v2.0. See
-[LICENSE](LICENSE) for the full terms.
+Licensed under the [GNU General Public License v2.0](LICENSE).
