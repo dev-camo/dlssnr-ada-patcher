@@ -1,6 +1,6 @@
 # Contributing
 
-Thanks for helping improve DLSS Neural Rendering Ada Patcher. Bug reports,
+Thanks for helping improve DLSS Neural Rendering RTX Patcher. Bug reports,
 documentation fixes, tests, and focused code changes are welcome.
 
 ## Before you start
@@ -69,8 +69,8 @@ This project modifies binary data, so unfamiliar input must fail closed:
   and external-tool failures.
 - Keep PTX rewrites narrow. Every newly accepted instruction shape needs both a
   success test and a rejection test for nearby unsupported input.
-- Preserve source ELF and PTX images when repacking fatbins. The generated Ada
-  cubin must remain additive, and rebuilt containers must fit their original
+- Preserve source ELF and PTX images when repacking fatbins. Generated target
+  cubins must remain additive, and rebuilt containers must fit their original
   allocations.
 - Route CUDA subprocesses through `run_tool`.
 - Preserve the staged atomic-write, backup, collision-check, and rollback

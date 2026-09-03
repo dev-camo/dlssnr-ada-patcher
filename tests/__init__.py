@@ -1,1 +1,1 @@
-"""Tests for the DLSS Neural Rendering Ada patcher."""
+"""Tests for the DLSS Neural Rendering RTX patcher."""

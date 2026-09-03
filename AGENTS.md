@@ -2,8 +2,10 @@
 
 ## Project Overview
 
-- This is a Python 3.10+ CLI patcher that adds Ada (`sm_89`) CUDA images and
-  enables Ada architecture paths in a user-supplied `nvngx_dlssnr.dll`.
+- This is a Python 3.10+ CLI patcher that ensures selected Turing (`sm_75`),
+  Ampere (`sm_86`), Ada (`sm_89`), and Blackwell (`sm_120`) CUDA images are
+  present and enables their architecture paths in a user-supplied
+  `nvngx_dlssnr.dll`.
 - `dlssnr_ada_patcher.py` contains the CLI and all PE parsing, CUDA fatbin
   handling, PTX transformation, host patching, verification, and output logic.
 - `tests/test_patcher.py` contains `unittest` coverage built from synthetic
@@ -40,8 +42,8 @@ real patcher run requires CUDA Toolkit 13.3 with `ptxas`, `fatbinary`, and
   rebuild and round-trip-check every fatbin, ensure each rebuilt container fits
   its original allocation, update the PE checksum, and only then write output.
 - Preserve source ELF images and source PTX content during fatbin repacking,
-  allowing only the intentional line-ending normalization. The generated Ada
-  cubin is additive, and unused fatbin space is padded so later PE offsets do
+  allowing only the intentional line-ending normalization. Generated target
+  cubins are additive, and unused fatbin space is padded so later PE offsets do
   not move.
 - Keep PTX transformations narrow. Add success and rejection tests for every
   newly supported instruction shape; do not silently accept an unknown form.
