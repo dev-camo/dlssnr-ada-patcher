@@ -207,7 +207,7 @@ def read_pe_sections(data: bytes | bytearray) -> list[PeSection]:
 
 
 def strip_authenticode(data: bytearray) -> AuthenticodeRemoval | None:
-    """Remove the PE certificate table and preserve all other file data."""
+    """Remove the signature invalidated by patching while preserving other data."""
     sections = read_pe_sections(data)
     pe_offset = pe_header_offset(data)
     section_count = struct.unpack_from("<H", data, pe_offset + 6)[0]
@@ -1058,6 +1058,8 @@ def lower_fp8_conversions(text: str, stats: TransformStats) -> str:
 
 
 def lower_fp8_operations(text: str, stats: TransformStats) -> str:
+    # Pre-Ada GPUs execute the source E4M3 path through integer conversions and
+    # FP16 MMAs, so results and performance can differ from native FP8.
     generic_mma_count = len(
         re.findall(
             r"\bmma\.[^;]*\.f16\.e4m3\.e4m3\.f16\b", text, re.DOTALL
