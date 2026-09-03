@@ -728,6 +728,22 @@ mbarrier.try_wait.shared::cta.b64 %p1, [%r18], %rd2;
         with self.assertRaisesRegex(patcher.PatchError, "mbarrier operation"):
             patcher.transform_ptx(source, patcher.TURING)
 
+    def test_reject_predicated_turing_mbarrier_operations(self) -> None:
+        instructions = (
+            "mbarrier.init.shared.b64",
+            "mbarrier.arrive.shared::cta.b64",
+            "mbarrier.try_wait.shared::cta.b64",
+        )
+        for instruction in instructions:
+            with self.subTest(instruction=instruction):
+                source = self.TURING_SOURCE.replace(
+                    instruction, f"@%p2 {instruction}"
+                )
+                with self.assertRaisesRegex(
+                    patcher.PatchError, "predicated mbarrier operation"
+                ):
+                    patcher.transform_ptx(source, patcher.TURING)
+
     def test_transform_1024_byte_copy(self) -> None:
         source = self.SOURCE.replace("mov.b32 %r3, 512;", "mov.b32 %r3, 1024;")
         output, _stats = patcher.transform_ptx(source)

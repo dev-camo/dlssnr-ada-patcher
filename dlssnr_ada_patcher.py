@@ -1108,15 +1108,20 @@ ASYNC_WAIT_PATTERN = re.compile(
     rf"(?P<guard>@!?{PTX_PREDICATE}\s+)?cp\.async\.wait_group\s+0\s*;"
 )
 MBARRIER_INIT_PATTERN = re.compile(
-    r"mbarrier\.init\.shared\.b64\s+\[(%r\d+)\],\s*(%r\d+)\s*;"
+    rf"(?P<guard>@!?{PTX_PREDICATE}\s+)?"
+    r"mbarrier\.init\.shared\.b64\s+"
+    r"\[(?P<storage>%r\d+)\],\s*(?P<count>%r\d+)\s*;"
 )
 MBARRIER_ARRIVE_PATTERN = re.compile(
+    rf"(?P<guard>@!?{PTX_PREDICATE}\s+)?"
     r"mbarrier\.arrive\.shared::cta\.b64\s+"
-    r"(%rd\d+),\s*\[(%r\d+)\]\s*;"
+    r"(?P<state>%rd\d+),\s*\[(?P<storage>%r\d+)\]\s*;"
 )
 MBARRIER_WAIT_PATTERN = re.compile(
+    rf"(?P<guard>@!?{PTX_PREDICATE}\s+)?"
     r"mbarrier\.test_wait\.shared::cta\.b64\s+"
-    r"((?:%p\d+|[A-Za-z_][\w$]*)),\s*\[(%r\d+)\],\s*(%rd\d+)\s*;"
+    rf"(?P<result>{PTX_PREDICATE}),\s*"
+    r"\[(?P<storage>%r\d+)\],\s*(?P<state>%rd\d+)\s*;"
 )
 
 
@@ -1262,11 +1267,19 @@ def lower_turing_async_copies(text: str, stats: TransformStats) -> str:
 def lower_turing_mbarriers(text: str, stats: TransformStats) -> str:
     generic_count = len(re.findall(r"\bmbarrier\.[^;\n]+;", text))
     init_matches = list(MBARRIER_INIT_PATTERN.finditer(text))
+    arrive_matches = list(MBARRIER_ARRIVE_PATTERN.finditer(text))
+    wait_matches = list(MBARRIER_WAIT_PATTERN.finditer(text))
     init_count = len(init_matches)
-    arrive_count = len(MBARRIER_ARRIVE_PATTERN.findall(text))
-    wait_count = len(MBARRIER_WAIT_PATTERN.findall(text))
+    arrive_count = len(arrive_matches)
+    wait_count = len(wait_matches)
     if init_count + arrive_count + wait_count != generic_count:
         raise PatchError("An mbarrier operation has an unsupported form for Turing.")
+    if any(
+        match.group("guard")
+        for matches in (init_matches, arrive_matches, wait_matches)
+        for match in matches
+    ):
+        raise PatchError("A predicated mbarrier operation is unsupported for Turing.")
     if arrive_count != wait_count:
         raise PatchError("Turing mbarrier arrivals and waits are not paired.")
 
@@ -1275,7 +1288,7 @@ def lower_turing_mbarriers(text: str, stats: TransformStats) -> str:
     for match in init_matches:
         start = max(0, match.start() - 2000)
         prefix = text[start : match.start()]
-        count_register = match.group(2)
+        count_register = match.group("count")
         multiply_pattern = re.compile(
             r"mul\.lo\.s32\s+"
             + re.escape(count_register)
@@ -1303,7 +1316,7 @@ def lower_turing_mbarriers(text: str, stats: TransformStats) -> str:
 
     text = MBARRIER_INIT_PATTERN.sub("", text)
     text = MBARRIER_ARRIVE_PATTERN.sub("bar.sync 0;", text)
-    text = MBARRIER_WAIT_PATTERN.sub(r"mov.pred \1, 1;", text)
+    text = MBARRIER_WAIT_PATTERN.sub(r"mov.pred \g<result>, 1;", text)
     stats.add("barrier_init", init_count)
     stats.add("barrier_sync", arrive_count)
     return text
