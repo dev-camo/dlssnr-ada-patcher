@@ -119,6 +119,14 @@ class Image:
     path: Path
 
 
+@dataclass
+class ArchitectureBuild:
+    architecture: Architecture
+    cubin_size: int
+    generated: bool
+    stats: TransformStats = field(default_factory=TransformStats)
+
+
 @dataclass(frozen=True)
 class ArchitectureRequirementPatch:
     interface: str
@@ -1293,7 +1301,10 @@ def transform_ptx(
 
     def replace_version(match: re.Match[str]) -> str:
         version = (int(match.group(2)), int(match.group(3)))
-        if version <= MAX_COMPATIBLE_PTX_VERSION:
+        if (
+            target.cuda >= BLACKWELL.cuda
+            or version <= MAX_COMPATIBLE_PTX_VERSION
+        ):
             return match.group(0)
         stats.add("ptx_version", 1)
         return (
@@ -1312,6 +1323,8 @@ def transform_ptx(
     output = target_pattern.sub(rf"\g<1>{target.cuda_name}\2", output)
     stats.add("target", 1)
 
+    if target.cuda >= BLACKWELL.cuda:
+        return output, stats
     if target.cuda < ADA.cuda:
         output = lower_fp8_operations(output, stats)
 
@@ -1951,15 +1964,34 @@ def apply_host_patches(
     )
 
 
+def normalize_architectures(
+    architectures: Sequence[Architecture] | Architecture,
+) -> tuple[Architecture, ...]:
+    if isinstance(architectures, Architecture):
+        architectures = (architectures,)
+    unique: list[Architecture] = []
+    seen_cuda: set[int] = set()
+    for architecture in architectures:
+        if architecture not in SUPPORTED_ARCHITECTURES:
+            raise PatchError(f"Unsupported target architecture '{architecture.name}'.")
+        if architecture.cuda not in seen_cuda:
+            unique.append(architecture)
+            seen_cuda.add(architecture.cuda)
+    if not unique:
+        raise PatchError("At least one target architecture is required.")
+    return tuple(unique)
+
+
 def repack_fatbin(
     index: int,
     source_blob: bytes,
     tools: CudaTools,
     root: Path,
-    target: Architecture = ADA,
-) -> tuple[bytes, TransformStats, int]:
-    # Preserve every source ELF image, normalize source PTX line endings, and
-    # add one compiled target image. Repack instead of editing compressed bytes.
+    architectures: Sequence[Architecture] | Architecture = (ADA,),
+) -> tuple[bytes, tuple[ArchitectureBuild, ...]]:
+    # Preserve every source image, normalize source PTX line endings, and add
+    # every selected cubin that is not already present.
+    targets = normalize_architectures(architectures)
     work_dir = root / f"fatbin_{index:02d}"
     work_dir.mkdir(parents=True, exist_ok=False)
     source_path = work_dir / "input.fatbin"
@@ -1970,12 +2002,6 @@ def repack_fatbin(
     if len(ptx_images) != 1:
         raise PatchError(
             f"Fatbin {index} has {len(ptx_images)} PTX images. Exactly one is required."
-        )
-    if any(
-        image.kind == "elf" and image.architecture == target.cuda for image in images
-    ):
-        raise PatchError(
-            f"Fatbin {index} already contains a {target.cuda_name} ELF image."
         )
 
     source_ptx_image = ptx_images[0]
@@ -1994,26 +2020,61 @@ def repack_fatbin(
     ):
         raise PatchError(f"Fatbin {index} has no sm_{source_arch} ELF image.")
 
-    transformed_ptx, stats = transform_ptx(source_ptx, target)
-    transformed_path = work_dir / f"{target.name}.ptx"
-    transformed_path.write_bytes(transformed_ptx.encode("utf-8"))
-    target_cubin = work_dir / f"{target.name}.{target.cuda_name}.cubin"
-    # Turing's expanded k8 MMA stream is intentionally repetitive. O1 keeps
-    # that stream compressible enough for the DLL's fixed fatbin allocations.
-    ptxas_options = ["--opt-level=1"] if target == TURING else []
-    run_tool(
-        [
-            tools.ptxas,
-            f"--gpu-name={target.cuda_name}",
-            *ptxas_options,
-            transformed_path,
-            "--output-file",
-            target_cubin,
-        ]
-    )
-    if not target_cubin.is_file() or target_cubin.stat().st_size == 0:
-        raise PatchError(
-            f"ptxas did not create the {target.cuda_name} cubin for fatbin {index}."
+    elf_images: dict[int, list[Image]] = {}
+    for image in images:
+        if image.kind == "elf":
+            elf_images.setdefault(image.architecture, []).append(image)
+
+    def compile_cubin(
+        target: Architecture,
+        transformed_path: Path,
+        target_cubin: Path,
+        *,
+        compact: bool,
+    ) -> None:
+        # Turing's expanded k8 MMA stream is intentionally repetitive. O1 keeps
+        # that stream compressible enough for the fixed fatbin allocations.
+        ptxas_options = ["--opt-level=1"] if target == TURING or compact else []
+        run_tool(
+            [
+                tools.ptxas,
+                f"--gpu-name={target.cuda_name}",
+                *ptxas_options,
+                transformed_path,
+                "--output-file",
+                target_cubin,
+            ]
+        )
+        if not target_cubin.is_file() or target_cubin.stat().st_size == 0:
+            raise PatchError(
+                f"ptxas did not create the {target.cuda_name} cubin for fatbin "
+                f"{index}."
+            )
+
+    builds: list[ArchitectureBuild] = []
+    generated_images: list[Image] = []
+    generated_paths: dict[int, tuple[Path, Path]] = {}
+    for target in targets:
+        existing = elf_images.get(target.cuda, [])
+        if len(existing) > 1:
+            raise PatchError(
+                f"Fatbin {index} contains multiple {target.cuda_name} ELF images."
+            )
+        if existing:
+            builds.append(
+                ArchitectureBuild(target, existing[0].path.stat().st_size, False)
+            )
+            continue
+
+        transformed_ptx, stats = transform_ptx(source_ptx, target)
+        transformed_path = work_dir / f"{target.name}.ptx"
+        transformed_path.write_bytes(transformed_ptx.encode("utf-8"))
+        target_cubin = work_dir / f"{target.name}.{target.cuda_name}.cubin"
+        compile_cubin(target, transformed_path, target_cubin, compact=False)
+        generated_images.append(Image("elf", target.cuda, target_cubin))
+        generated_paths[target.cuda] = (transformed_path, target_cubin)
+        builds.append(
+            ArchitectureBuild(target, target_cubin.stat().st_size, True, stats)
         )
 
     deterministic_images: list[Image] = []
@@ -2030,26 +2091,47 @@ def repack_fatbin(
         )
 
     output_path = work_dir / "output.fatbin"
-    command: list[os.PathLike[str] | str] = [
-        tools.fatbinary,
-        "--64",
-        "--compress-all",
-        "--compress-mode=size",
-        "--create",
-        output_path,
-        f"--image3=kind=elf,sm={target.cuda},file={target_cubin}",
-    ]
-    for image in deterministic_images:
-        command.append(
-            f"--image3=kind={image.kind},sm={image.architecture},file={image.path}"
-        )
-    run_tool(command)
-    if not output_path.is_file():
-        raise PatchError(f"fatbinary did not create fatbin {index}.")
-    generated = preserve_record_flags(output_path.read_bytes(), source_blob)
 
-    # Round-trip through cuobjdump and compare payloads. The rebuilt container
-    # must keep each ELF and normalized PTX payload, plus the expected target image.
+    def build_fatbin() -> bytes:
+        output_path.unlink(missing_ok=True)
+        command: list[os.PathLike[str] | str] = [
+            tools.fatbinary,
+            "--64",
+            "--compress-all",
+            "--compress-mode=size",
+            "--create",
+            output_path,
+        ]
+        for image in [*generated_images, *deterministic_images]:
+            command.append(
+                f"--image3=kind={image.kind},sm={image.architecture},file={image.path}"
+            )
+        run_tool(command)
+        if not output_path.is_file():
+            raise PatchError(f"fatbinary did not create fatbin {index}.")
+        return preserve_record_flags(output_path.read_bytes(), source_blob)
+
+    generated = build_fatbin()
+    # Keep O3 whenever it fits. If a combined build is too large, progressively
+    # favor compressibility for the generated pre-Blackwell cubins.
+    if len(generated) > len(source_blob):
+        for compact_target in (AMPERE, ADA):
+            paths = generated_paths.get(compact_target.cuda)
+            if paths is None:
+                continue
+            transformed_path, target_cubin = paths
+            compile_cubin(
+                compact_target, transformed_path, target_cubin, compact=True
+            )
+            for build in builds:
+                if build.architecture == compact_target:
+                    build.cubin_size = target_cubin.stat().st_size
+                    break
+            generated = build_fatbin()
+            if len(generated) <= len(source_blob):
+                break
+
+    # Round-trip through cuobjdump and compare every source and generated image.
     verification_path = work_dir / "verified.fatbin"
     verification_path.write_bytes(generated)
     verification_dir = work_dir / "verification"
@@ -2059,12 +2141,11 @@ def repack_fatbin(
     )
 
     expected: dict[tuple[str, int], list[bytes]] = {}
-    for image in images:
+    for image in [*images, *generated_images]:
         payload = image.path.read_bytes()
         if image.kind == "ptx":
             payload = canonical_ptx(payload)
         expected.setdefault((image.kind, image.architecture), []).append(payload)
-    expected.setdefault(("elf", target.cuda), []).append(target_cubin.read_bytes())
 
     for image in verified_images:
         key = (image.kind, image.architecture)
@@ -2088,7 +2169,7 @@ def repack_fatbin(
         raise PatchError(
             f"Fatbin {index} lost these CUDA images: {', '.join(missing)}."
         )
-    return generated, stats, target_cubin.stat().st_size
+    return generated, tuple(builds)
 
 
 def path_exists(path: Path) -> bool:
@@ -2223,8 +2304,9 @@ def patch_file(
     force: bool,
     dry_run: bool,
     work_dir: Path | None,
-    target: Architecture = ADA,
+    architectures: Sequence[Architecture] | Architecture = SUPPORTED_ARCHITECTURES,
 ) -> None:
+    targets = normalize_architectures(architectures)
     input_path = input_path.resolve()
     if not input_path.is_file():
         raise PatchError(f"Input file does not exist: {input_path}")
@@ -2239,11 +2321,12 @@ def patch_file(
     data = bytearray(source_bytes)
     authenticode = strip_authenticode(data)
     locations = find_fatbins(data)
-    host = apply_host_patches(data, (target,))
+    host = apply_host_patches(data, targets)
 
     print(f"Input:  {input_path}")
     print(f"SHA-256: {sha256_bytes(source_bytes)}")
     print(f"CUDA:   {cuda_version(tools.ptxas)}")
+    print("Targets: " + ", ".join(target.cuda_name for target in targets))
     print(f"Fatbins: {len(locations)}")
     if authenticode is None:
         print("Authenticode: no certificate table was present")
@@ -2280,9 +2363,8 @@ def patch_file(
 
     temporary_context: tempfile.TemporaryDirectory[str] | None = None
     if work_dir is None:
-        temporary_context = tempfile.TemporaryDirectory(
-            prefix=f"dlssnr-{target.name}-"
-        )
+        label = targets[0].name if len(targets) == 1 else "universal"
+        temporary_context = tempfile.TemporaryDirectory(prefix=f"dlssnr-{label}-")
         build_root = Path(temporary_context.name)
     else:
         build_root = work_dir.resolve()
@@ -2293,12 +2375,12 @@ def patch_file(
                 raise PatchError(f"Work directory is not empty: {build_root}")
         build_root.mkdir(parents=True, exist_ok=True)
 
-    totals = TransformStats()
+    totals = {target.name: TransformStats() for target in targets}
     try:
         for index, location in enumerate(locations):
             source_blob = bytes(data[location.offset : location.offset + location.size])
-            generated, stats, cubin_size = repack_fatbin(
-                index, source_blob, tools, build_root, target
+            generated, builds = repack_fatbin(
+                index, source_blob, tools, build_root, targets
             )
             if len(generated) > location.size:
                 raise PatchError(
@@ -2310,12 +2392,19 @@ def patch_file(
             data[location.offset : location.offset + location.size] = generated + bytes(
                 location.size - len(generated)
             )
-            for name, count in stats.values.items():
-                totals.add(name, count)
+            summaries = []
+            for build in builds:
+                if build.generated:
+                    for name, count in build.stats.values.items():
+                        totals[build.architecture.name].add(name, count)
+                    detail = f"{build.cubin_size} bytes; {build.stats.summary()}"
+                else:
+                    detail = f"existing {build.cubin_size} bytes"
+                summaries.append(f"{build.architecture.cuda_name} {detail}")
             print(
                 f"[{index + 1:02d}/{len(locations):02d}] "
                 f"0x{location.offset:x}: {location.size} -> {len(generated)} bytes; "
-                f"{target.cuda_name} cubin {cubin_size} bytes; {stats.summary()}"
+                + "; ".join(summaries)
             )
     finally:
         if temporary_context is not None:
@@ -2326,7 +2415,12 @@ def patch_file(
     # Update the PE checksum after all file changes, including certificate
     # removal.
     pe_checksum = update_pe_checksum(data)
-    print(f"Transforms: {totals.summary()}")
+    transform_summaries = [
+        f"{target.name}: {totals[target.name].summary()}"
+        for target in targets
+        if totals[target.name].values
+    ]
+    print("Transforms: " + ("; ".join(transform_summaries) or "none"))
     print(f"PE checksum: 0x{pe_checksum:08x}")
     print(f"Output SHA-256: {sha256_bytes(data)}")
     if dry_run:
@@ -2348,15 +2442,50 @@ def patch_file(
     )
 
 
+def selected_architectures(args: argparse.Namespace) -> tuple[Architecture, ...]:
+    selected = tuple(
+        architecture
+        for architecture in SUPPORTED_ARCHITECTURES
+        if getattr(args, architecture.name)
+    )
+    return selected or SUPPORTED_ARCHITECTURES
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Add sm_89 CUDA images and enable Ada in all detected NGX interfaces "
-            "in a user-supplied nvngx_dlssnr.dll."
+            "Add selected CUDA architectures and enable their NGX paths in a "
+            "user-supplied nvngx_dlssnr.dll. All supported RTX generations are "
+            "selected when no architecture flags are given."
         )
     )
     parser.add_argument(
         "input", type=Path, help="Path to the original nvngx_dlssnr.dll"
+    )
+    architecture_group = parser.add_argument_group("target architectures")
+    architecture_group.add_argument(
+        "-t",
+        "--turing",
+        action="store_true",
+        help="Include Turing / RTX 20 Series (sm_75)",
+    )
+    architecture_group.add_argument(
+        "-A",
+        "--ampere",
+        action="store_true",
+        help="Include Ampere / RTX 30 Series (sm_86)",
+    )
+    architecture_group.add_argument(
+        "-a",
+        "--ada",
+        action="store_true",
+        help="Include Ada / RTX 40 Series (sm_89)",
+    )
+    architecture_group.add_argument(
+        "-b",
+        "--blackwell",
+        action="store_true",
+        help="Include Blackwell / RTX 50 Series (sm_120)",
     )
     parser.add_argument(
         "-o",
@@ -2399,6 +2528,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             force=args.force,
             dry_run=args.dry_run,
             work_dir=args.work_dir,
+            architectures=selected_architectures(args),
         )
     except PatchError as error:
         print(f"error: {error}", file=sys.stderr)

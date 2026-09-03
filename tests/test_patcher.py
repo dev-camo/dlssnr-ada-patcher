@@ -29,6 +29,38 @@ class OutputTests(unittest.TestCase):
         )
         self.assertEqual(arguments.output, Path("patched.dll"))
 
+    def test_no_architecture_flags_selects_every_generation(self) -> None:
+        arguments = patcher.build_parser().parse_args(["nvngx_dlssnr.dll"])
+        self.assertEqual(
+            patcher.selected_architectures(arguments),
+            patcher.SUPPORTED_ARCHITECTURES,
+        )
+
+    def test_long_architecture_flags_can_be_combined(self) -> None:
+        arguments = patcher.build_parser().parse_args(
+            ["nvngx_dlssnr.dll", "--ada", "--turing"]
+        )
+        self.assertEqual(
+            patcher.selected_architectures(arguments),
+            (patcher.TURING, patcher.ADA),
+        )
+
+    def test_short_architecture_flags(self) -> None:
+        flags = {
+            "-t": patcher.TURING,
+            "-A": patcher.AMPERE,
+            "-a": patcher.ADA,
+            "-b": patcher.BLACKWELL,
+        }
+        for flag, architecture in flags.items():
+            with self.subTest(flag=flag):
+                arguments = patcher.build_parser().parse_args(
+                    ["nvngx_dlssnr.dll", flag]
+                )
+                self.assertEqual(
+                    patcher.selected_architectures(arguments), (architecture,)
+                )
+
     def test_default_plan_replaces_input_and_uses_backup(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             input_path = Path(directory) / "nvngx_dlssnr.dll"
@@ -416,6 +448,18 @@ class PeTests(unittest.TestCase):
 
 
 class FatbinTests(unittest.TestCase):
+    def test_normalize_architectures_deduplicates_targets(self) -> None:
+        self.assertEqual(
+            patcher.normalize_architectures(
+                (patcher.ADA, patcher.TURING, patcher.ADA)
+            ),
+            (patcher.ADA, patcher.TURING),
+        )
+
+    def test_normalize_architectures_rejects_empty_selection(self) -> None:
+        with self.assertRaisesRegex(patcher.PatchError, "At least one"):
+            patcher.normalize_architectures(())
+
     def test_find_and_parse_fatbin(self) -> None:
         fatbin = make_fatbin(make_record(1, 0x8041), make_record(2, 0x1000041))
         data = b"prefix" + fatbin + b"suffix"
@@ -531,6 +575,13 @@ mbarrier.try_wait.shared::cta.b64 %p1, [%r18], %rd2;
         output, stats = patcher.transform_ptx(self.FP8_SOURCE, patcher.ADA)
         self.assertIn(".e4m3", output)
         self.assertNotIn("fp8_mma", stats.values)
+
+    def test_transform_blackwell_keeps_native_ptx(self) -> None:
+        output, stats = patcher.transform_ptx(self.SOURCE, patcher.BLACKWELL)
+        self.assertIn(".version 9.4", output)
+        self.assertIn(".target sm_120", output)
+        self.assertIn("cp.async.bulk", output)
+        self.assertNotIn("ptx_version", stats.values)
 
     def test_reject_unsupported_fp8_matrix_shape(self) -> None:
         source = self.FP8_SOURCE.replace(".m16n8k32.row.col", ".m16n8k32.col.row")
