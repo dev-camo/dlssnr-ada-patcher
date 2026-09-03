@@ -1,56 +1,74 @@
 # DLSS Neural Rendering Patcher
 
-Patch a user-supplied `nvngx_dlssnr.dll` for NVIDIA GeForce RTX 20, 30, 40,
-and 50 Series GPUs.
+DLSS Neural Rendering Patcher is a command-line tool that prepares your copy
+of `nvngx_dlssnr.dll` for NVIDIA GeForce RTX 20, 30, and 40 Series GPUs.
 
-The script ensures the selected CUDA images are present, enables the
-corresponding NGX architecture paths, verifies the rebuilt containers, and
-updates the PE checksum. It does not include, download, or distribute NVIDIA
-DLLs or model files.
+The patcher checks its work before writing the patched file. It does not
+include, download, or distribute NVIDIA DLLs or model files.
 
-> **Safety warning:** Patching invalidates the DLL's NVIDIA Authenticode
-> signature and can trigger anti-cheat or file-integrity systems. Do not use a
-> patched DLL with online, competitive, or anti-cheat-protected software.
+> **Safety warning:** Patching changes the DLL and invalidates its NVIDIA
+> digital signature. Anti-cheat or file-integrity systems may flag the modified
+> file. Do not use it with online, competitive, or anti-cheat-protected
+> software.
 
 ## Requirements
 
-- Python 3.10 or newer
+- [Python 3.10 or newer](https://www.python.org/downloads/)
 - [CUDA Toolkit 13.3](https://developer.nvidia.com/cuda-downloads)
-- Your own copy of `nvngx_dlssnr.dll`
+  - **Windows:** If the CUDA installer reports that Visual Studio is missing,
+    you can ignore the message and continue the installation. Visual Studio is
+    not required to run this patcher.
+  - The CUDA tools `ptxas`, `fatbinary`, and `cuobjdump` must be available on
+    your system's `PATH`. If the patcher cannot find them, use `--cuda-bin` to
+    point it to the CUDA Toolkit's `bin` folder.
+- Your own original copy of `nvngx_dlssnr.dll`
 
-`ptxas`, `fatbinary`, and `cuobjdump` must be on `PATH`. Alternatively, pass
-their directory with `--cuda-bin`.
+## Basic use
 
-## Use
-
-1. Copy the original DLL somewhere safe.
-2. Open a terminal in this repository.
-3. Run:
+1. Download this repository as a ZIP file and extract it.
+2. Find your original `nvngx_dlssnr.dll` and save a separate copy somewhere
+   safe.
+3. Open Command Prompt, PowerShell, or a terminal in the patcher's folder.
+4. Run:
 
    ```text
    python dlssnr_patcher.py "C:\path\to\nvngx_dlssnr.dll"
    ```
 
-With no architecture flags, the patcher includes every supported generation:
+Replace the example path with the full path to your DLL. Keep the quotation
+marks, especially if the path contains spaces.
 
-| Generation | GeForce family | CUDA target | Flag |
-| --- | --- | --- | --- |
-| Turing | RTX 20 Series | `sm_75` | `-t`, `--turing` |
-| Ampere | RTX 30 Series | `sm_86` | `-A`, `--ampere` |
-| Ada | RTX 40 Series | `sm_89` | `-a`, `--ada` |
-| Blackwell | RTX 50 Series | `sm_120` | `-b`, `--blackwell` |
+With no GPU options, the patcher includes every supported generation. If you
+are unsure which option to use, run the basic command above.
 
-Use one or more flags to build only their union. For example:
+## Choosing GPU generations
+
+To select specific GPU generations instead of all four, add one or more of
+these options:
+
+| GeForce family | GPU generation | Option |
+| --- | --- | --- |
+| RTX 20 Series | Turing | `-t`, `--turing` |
+| RTX 30 Series | Ampere | `-A`, `--ampere` |
+| RTX 40 Series | Ada | `-a`, `--ada` |
+| RTX 50 Series | Blackwell | `-b`, `--blackwell` |
+
+Options can be combined. For example, this command selects Turing and Ampere:
 
 ```text
 python dlssnr_patcher.py --turing --ampere "C:\path\to\nvngx_dlssnr.dll"
 ```
 
-By default, the original becomes `nvngx_dlssnr.dll.bak` and the patched file
-takes its place. Use `--output patched.dll` to keep the input unchanged, or
-`--dry-run` to compile and verify without writing an output file.
+## Output and backups
 
-Run `python dlssnr_patcher.py --help` for every option.
+By default, the patcher renames the original file to
+`nvngx_dlssnr.dll.bak`, then saves the patched file as `nvngx_dlssnr.dll`. It
+will not overwrite an existing backup.
+
+Use `--output patched.dll` to keep the input file unchanged. Use `--dry-run`
+to check the DLL and compile the changes without writing an output file.
+
+Run `python dlssnr_patcher.py --help` to see every option.
 
 ## Contributing
 
