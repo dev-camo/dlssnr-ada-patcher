@@ -791,6 +791,14 @@ mbarrier.try_wait.shared::cta.b64 %p1, [%r18], %rd2;
         with self.assertRaisesRegex(patcher.PatchError, "ordered in supported groups"):
             patcher.transform_ptx(source)
 
+    def test_reject_predicated_bulk_copy(self) -> None:
+        source = self.SOURCE.replace(
+            "cp.async.bulk.shared::cta.global",
+            "@!P1 cp.async.bulk.shared::cta.global",
+        )
+        with self.assertRaisesRegex(patcher.PatchError, "predicated bulk-copy"):
+            patcher.transform_ptx(source)
+
     def test_reject_mismatched_bulk_expectation(self) -> None:
         source = self.SOURCE.replace(
             "mbarrier.expect_tx.relaxed.cta.shared::cta.b64 [%r2], %r3;",

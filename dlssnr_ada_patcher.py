@@ -1384,8 +1384,11 @@ def transform_ptx(
         rf"elect\.sync\s+_\|({PTX_PREDICATE}),\s*%r\d+\s*;"
     )
     bulk_pattern = re.compile(
+        rf"(?P<guard>@!?{PTX_PREDICATE}\s+)?"
         r"cp\.async\.bulk\.shared::cta\.global\.mbarrier::complete_tx::bytes\s+"
-        r"\[(%r\d+)\],\s*\[(%rd\d+)\],\s*(%r\d+),\s*\[(%r\d+)\]\s*;"
+        r"\[(?P<destination>%r\d+)\],\s*"
+        r"\[(?P<source>%rd\d+)\],\s*(?P<size>%r\d+),\s*"
+        r"\[(?P<barrier>%r\d+)\]\s*;"
     )
     expect_pattern = re.compile(
         rf"(?P<guard>@!?{PTX_PREDICATE}\s+)?"
@@ -1402,6 +1405,8 @@ def transform_ptx(
         raise PatchError("An elect operation has an unsupported form.")
     if len(bulk_matches) != len(generic_bulks):
         raise PatchError("A bulk-copy operation has an unsupported form.")
+    if any(match.group("guard") for match in bulk_matches):
+        raise PatchError("A predicated bulk-copy operation is unsupported.")
     if len(expect_matches) != len(generic_expects):
         raise PatchError("A transaction expectation has an unsupported form.")
     if any(match.group("guard") for match in expect_matches):
@@ -1423,7 +1428,7 @@ def transform_ptx(
     ):
         if elect.group(1) not in output[elect.end() : bulk.start()]:
             raise PatchError("An elected predicate does not control its bulk copy.")
-        if (bulk.group(4), bulk.group(3)) != (
+        if (bulk.group("barrier"), bulk.group("size")) != (
             expect.group("barrier"),
             expect.group("size"),
         ):
@@ -1474,7 +1479,9 @@ def transform_ptx(
     # copies. Targets with asynchronous copies wait for their normal copy group;
     # Turing uses synchronous vector loads and stores instead.
     def replace_bulk(match: re.Match[str]) -> str:
-        destination, source_address, size_register, _barrier = match.groups()
+        destination = match.group("destination")
+        source_address = match.group("source")
+        size_register = match.group("size")
         copy_size = previous_literal_assignment(output, match.start(), size_register)
         if copy_size not in (512, 1024):
             raise PatchError(f"Unsupported bulk-copy size {copy_size} bytes.")
