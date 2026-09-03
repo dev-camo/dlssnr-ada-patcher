@@ -571,6 +571,25 @@ mbarrier.try_wait.shared::cta.b64 %p1, [%r18], %rd2;
         self.assertIn(".target sm_86", output)
         self.assertNotIn(".target sm_89", output)
 
+    def test_reject_predicated_expanding_operations(self) -> None:
+        cases = (
+            (
+                "red.global.v4.f16x2.add.noftz",
+                "@%p2 red.global.v4.f16x2.add.noftz",
+                "predicated vector reduction",
+            ),
+            (
+                "min.relu.s32",
+                "@!P2 min.relu.s32",
+                "predicated fused minimum/ReLU",
+            ),
+        )
+        for instruction, replacement, message in cases:
+            with self.subTest(instruction=instruction):
+                source = self.SOURCE.replace(instruction, replacement)
+                with self.assertRaisesRegex(patcher.PatchError, message):
+                    patcher.transform_ptx(source)
+
     def test_transform_ampere_fp8_operations(self) -> None:
         output, stats = patcher.transform_ptx(self.FP8_SOURCE, patcher.AMPERE)
 

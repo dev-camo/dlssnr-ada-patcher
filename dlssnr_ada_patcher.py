@@ -1537,12 +1537,19 @@ def transform_ptx(
     # Older targets do not support the four-value vector reduction. Preserve its
     # values as separate packed-half reductions at adjacent addresses.
     reduction_pattern = re.compile(
-        r"red\.global\.v4\.f16x2\.add\.noftz\s+\[(%rd\d+)\],\s*"
-        r"\{\s*(%r\d+),\s*(%r\d+),\s*(%r\d+),\s*(%r\d+)\s*\}\s*;"
+        rf"(?P<guard>@!?{PTX_PREDICATE}\s+)?"
+        r"red\.global\.v4\.f16x2\.add\.noftz\s+"
+        r"\[(?P<address>%rd\d+)\],\s*"
+        r"\{\s*(?P<value0>%r\d+),\s*(?P<value1>%r\d+),\s*"
+        r"(?P<value2>%r\d+),\s*(?P<value3>%r\d+)\s*\}\s*;"
     )
+    reduction_matches = list(reduction_pattern.finditer(output))
+    if any(match.group("guard") for match in reduction_matches):
+        raise PatchError("A predicated vector reduction is unsupported.")
 
     def replace_reduction(match: re.Match[str]) -> str:
-        address, *values = match.groups()
+        address = match.group("address")
+        values = [match.group(f"value{index}") for index in range(4)]
         lines = []
         for index, value in enumerate(values):
             suffix = f"+{index * 4}" if index else ""
@@ -1559,9 +1566,18 @@ def transform_ptx(
     stats.add("release_fence", fence_count)
 
     # Expand fused signed minimum/ReLU into operations older targets support.
-    min_relu_pattern = re.compile(r"min\.relu\.s32\s+(%r\d+),\s*(%r\d+),\s*(%r\d+)\s*;")
+    min_relu_pattern = re.compile(
+        rf"(?P<guard>@!?{PTX_PREDICATE}\s+)?min\.relu\.s32\s+"
+        r"(?P<destination>%r\d+),\s*(?P<first>%r\d+),\s*"
+        r"(?P<second>%r\d+)\s*;"
+    )
+    min_relu_matches = list(min_relu_pattern.finditer(output))
+    if any(match.group("guard") for match in min_relu_matches):
+        raise PatchError("A predicated fused minimum/ReLU is unsupported.")
     output, min_relu_count = min_relu_pattern.subn(
-        r"min.s32 \1, \2, \3;\nmax.s32 \1, \1, 0;", output
+        r"min.s32 \g<destination>, \g<first>, \g<second>;\n"
+        r"max.s32 \g<destination>, \g<destination>, 0;",
+        output,
     )
     stats.add("min_relu", min_relu_count)
 
