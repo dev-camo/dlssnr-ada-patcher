@@ -21,13 +21,34 @@ FATBIN_MAGIC = 0xBA55ED50
 FATBIN_MAGIC_BYTES = struct.pack("<I", FATBIN_MAGIC)
 PE_MACHINE_AMD64 = 0x8664
 PE32_PLUS_MAGIC = 0x20B
-# CUDA names the Ada target sm_89. PTX newer than 9.3 is capped before
-# compilation because this patch targets the Ada toolchain's supported form.
-TARGET_ARCH = 89
-MAX_ADA_PTX_VERSION = (9, 3)
-# NGX uses a different numeric value and name for the host-side Ada checks.
-TARGET_NGX_ARCH = 0x190
-TARGET_NGX_ARCH_NAME = "NVSDK_NGX_GPU_Arch_Ada"
+MAX_COMPATIBLE_PTX_VERSION = (9, 3)
+
+
+@dataclass(frozen=True)
+class Architecture:
+    name: str
+    cuda: int
+    ngx: int
+    ngx_name: str
+
+    @property
+    def cuda_name(self) -> str:
+        return f"sm_{self.cuda}"
+
+
+TURING = Architecture("turing", 75, 0x160, "NVSDK_NGX_GPU_Arch_Turing")
+AMPERE = Architecture("ampere", 86, 0x170, "NVSDK_NGX_GPU_Arch_Ampere")
+ADA = Architecture("ada", 89, 0x190, "NVSDK_NGX_GPU_Arch_Ada")
+BLACKWELL = Architecture(
+    "blackwell", 120, 0x1B0, "NVSDK_NGX_GPU_Arch_Blackwell2"
+)
+SUPPORTED_ARCHITECTURES = (TURING, AMPERE, ADA, BLACKWELL)
+
+# Keep the original Ada constants available for callers of the former helpers.
+TARGET_ARCH = ADA.cuda
+MAX_ADA_PTX_VERSION = MAX_COMPATIBLE_PTX_VERSION
+TARGET_NGX_ARCH = ADA.ngx
+TARGET_NGX_ARCH_NAME = ADA.ngx_name
 
 
 class PatchError(RuntimeError):
@@ -109,14 +130,24 @@ class ArchitectureRequirementPatch:
 class ArchitectureCasePatch:
     offset: int
     success_offset: int
+    architecture: str = ADA.name
 
 
 @dataclass(frozen=True)
 class HostPatchResult:
     requirements: tuple[ArchitectureRequirementPatch, ...]
-    ada_cases: tuple[ArchitectureCasePatch, ...]
+    architecture_cases: tuple[ArchitectureCasePatch, ...]
     architecture_export_offset: int | None
     architecture_metadata_offsets: tuple[int, ...]
+
+    @property
+    def ada_cases(self) -> tuple[ArchitectureCasePatch, ...]:
+        """Return Ada patches for callers that use the former result field."""
+        return tuple(
+            patch
+            for patch in self.architecture_cases
+            if patch.architecture == ADA.name
+        )
 
 
 @dataclass(frozen=True)
@@ -604,13 +635,15 @@ def previous_literal_assignment(
     return int(value)
 
 
-def transform_ptx(source: str) -> tuple[str, TransformStats]:
+def transform_ptx(
+    source: str, target: Architecture = ADA
+) -> tuple[str, TransformStats]:
     # Keep these conversions narrow. If an instruction has an unknown form,
-    # fail instead of producing PTX that may run incorrectly on Ada.
+    # fail instead of producing PTX that may run incorrectly on the target.
     stats = TransformStats()
 
-    # Recompile the embedded program for Ada. Limit the PTX version before
-    # ptxas sees it; the selected toolchain supports PTX 9.3 for this target.
+    # Limit the PTX version before ptxas sees it; the selected toolchain uses
+    # PTX 9.3 for the pre-Blackwell targets supported by these conversions.
     version_pattern = re.compile(r"(?m)^(\s*\.version\s+)(\d+)\.(\d+)(\s*)$")
     version_matches = list(version_pattern.finditer(source))
     if len(version_matches) != 1:
@@ -620,10 +653,13 @@ def transform_ptx(source: str) -> tuple[str, TransformStats]:
 
     def replace_version(match: re.Match[str]) -> str:
         version = (int(match.group(2)), int(match.group(3)))
-        if version <= MAX_ADA_PTX_VERSION:
+        if version <= MAX_COMPATIBLE_PTX_VERSION:
             return match.group(0)
         stats.add("ptx_version", 1)
-        return f"{match.group(1)}{MAX_ADA_PTX_VERSION[0]}.{MAX_ADA_PTX_VERSION[1]}{match.group(4)}"
+        return (
+            f"{match.group(1)}{MAX_COMPATIBLE_PTX_VERSION[0]}."
+            f"{MAX_COMPATIBLE_PTX_VERSION[1]}{match.group(4)}"
+        )
 
     output = version_pattern.sub(replace_version, source)
 
@@ -633,11 +669,12 @@ def transform_ptx(source: str) -> tuple[str, TransformStats]:
         raise PatchError(
             f"Expected one PTX target directive, found {len(target_matches)}."
         )
-    output = target_pattern.sub(rf"\g<1>sm_{TARGET_ARCH}\2", output)
+    output = target_pattern.sub(rf"\g<1>{target.cuda_name}\2", output)
     stats.add("target", 1)
 
-    # Ada has no equivalent for the newer warp bulk-copy instruction. Accept
-    # only ordered elect/copy/expect groups whose barrier operands match.
+    # Pre-Blackwell targets have no equivalent for the newer warp bulk-copy
+    # instruction. Accept only ordered elect/copy/expect groups whose barrier
+    # operands match.
     predicate = r"(?:%p\d+|[A-Za-z_][\w$]*)"
     elect_pattern = re.compile(rf"elect\.sync\s+_\|({predicate}),\s*%r\d+\s*;")
     bulk_pattern = re.compile(
@@ -915,6 +952,7 @@ def patch_minimum_architectures(
     data: bytearray,
     sections: Sequence[PeSection],
     exports: dict[str, int],
+    target_ngx_architecture: int = ADA.ngx,
 ) -> tuple[ArchitectureRequirementPatch, ...]:
     pattern = re.compile(r"^NVSDK_NGX_([A-Z0-9_]+)_GetFeatureRequirements$")
     requirement_exports = sorted(
@@ -937,8 +975,8 @@ def patch_minimum_architectures(
         (patch.offset, patch.previous_value) for patch in patches
     )
     for offset, previous_value in unique_requirements:
-        if previous_value > TARGET_NGX_ARCH:
-            struct.pack_into("<I", data, offset, TARGET_NGX_ARCH)
+        if previous_value > target_ngx_architecture:
+            struct.pack_into("<I", data, offset, target_ngx_architecture)
     return tuple(patches)
 
 
@@ -946,6 +984,7 @@ def patch_exported_architecture(
     data: bytearray,
     sections: Sequence[PeSection],
     exports: dict[str, int],
+    target_ngx_architecture: int = ADA.ngx,
 ) -> tuple[int, int] | None:
     name = "NVSDK_NGX_GetGPUArchitecture"
     if name not in exports:
@@ -964,13 +1003,16 @@ def patch_exported_architecture(
             f"{len(candidates)}."
         )
     immediate_offset, previous_value = candidates[0]
-    if previous_value > TARGET_NGX_ARCH:
-        struct.pack_into("<I", data, immediate_offset, TARGET_NGX_ARCH)
+    if previous_value > target_ngx_architecture:
+        struct.pack_into("<I", data, immediate_offset, target_ngx_architecture)
     return immediate_offset, previous_value
 
 
 def patch_architecture_metadata(
-    data: bytearray, *, lower_architecture: bool
+    data: bytearray,
+    *,
+    lower_architecture: bool,
+    target_name: str = ADA.ngx_name,
 ) -> tuple[int, ...]:
     if not lower_architecture:
         return ()
@@ -1012,17 +1054,17 @@ def patch_architecture_metadata(
         value = value.split("\0", 1)[0]
         if not value.startswith("NVSDK_NGX_GPU_Arch_"):
             raise PatchError(f"Unexpected NGX architecture metadata value '{value}'.")
-        if value == TARGET_NGX_ARCH_NAME:
+        if value == target_name:
             continue
-        replacement = (TARGET_NGX_ARCH_NAME + "\0").encode("utf-16le")
+        replacement = (target_name + "\0").encode("utf-16le")
         if len(replacement) > value_size:
             raise PatchError(
-                "The Ada architecture name does not fit the metadata entry."
+                f"The {target_name} value does not fit the metadata entry."
             )
         data[value_offset : value_offset + value_size] = replacement.ljust(
             value_size, b"\0"
         )
-        struct.pack_into("<H", data, header_offset + 2, len(TARGET_NGX_ARCH_NAME) + 1)
+        struct.pack_into("<H", data, header_offset + 2, len(target_name) + 1)
         patched_offsets.append(value_offset)
     return tuple(patched_offsets)
 
@@ -1045,7 +1087,10 @@ def decode_architecture_case_entry(
 
 
 def find_success_target(
-    data: bytes | bytearray, cases_end: int, failure_target: int
+    data: bytes | bytearray,
+    cases_end: int,
+    failure_target: int,
+    target_ngx_architecture: int = ADA.ngx,
 ) -> int | None:
     if not cases_end <= failure_target <= len(data):
         return None
@@ -1054,7 +1099,10 @@ def find_success_target(
     while compare >= 0:
         if compare + 5 <= len(data):
             lower_bound = struct.unpack_from("<I", data, compare + 1)[0]
-            if is_ngx_architecture(lower_bound) and lower_bound <= TARGET_NGX_ARCH:
+            if (
+                is_ngx_architecture(lower_bound)
+                and lower_bound <= target_ngx_architecture
+            ):
                 branch = compare + 5
                 if branch + 2 == failure_target and data[branch] == 0x7D:
                     target = branch + 2 + struct.unpack_from("<b", data, branch + 1)[0]
@@ -1071,32 +1119,35 @@ def find_success_target(
 
 def find_architecture_cases(
     data: bytes | bytearray,
+    target_ngx_architecture: int = ADA.ngx,
 ) -> list[tuple[int, int, int, int]]:
     candidates: list[tuple[int, int, int, int]] = []
     for register in range(8):
         # RSP cannot hold a normal architecture case value.
         if register == 4:
             continue
-        marker = (
-            bytes((0xB8 + register,)) + struct.pack("<I", TARGET_NGX_ARCH) + b"\xeb"
-        )
+        marker = bytes((0xB8 + register,)) + struct.pack(
+            "<I", target_ngx_architecture
+        ) + b"\xeb"
         position = 0
         while True:
-            ada_offset = data.find(marker, position)
-            if ada_offset < 0:
+            target_offset = data.find(marker, position)
+            if target_offset < 0:
                 break
-            position = ada_offset + 1
-            ada_entry = decode_architecture_case_entry(data, ada_offset, register)
-            if ada_entry is None:
+            position = target_offset + 1
+            target_entry = decode_architecture_case_entry(
+                data, target_offset, register
+            )
+            if target_entry is None:
                 continue
-            _ada_value, failure_target = ada_entry
-            start = ada_offset
+            _target_value, failure_target = target_entry
+            start = target_offset
             while True:
                 previous = decode_architecture_case_entry(data, start - 7, register)
                 if previous is None or previous[1] != failure_target:
                     break
                 start -= 7
-            end = ada_offset + 7
+            end = target_offset + 7
             while True:
                 following = decode_architecture_case_entry(data, end, register)
                 if following is None or following[1] != failure_target:
@@ -1110,28 +1161,49 @@ def find_architecture_cases(
             if (
                 len(values) < 4
                 or len(values) != len(set(values))
-                or min(values) >= TARGET_NGX_ARCH
-                or max(values) <= TARGET_NGX_ARCH
+                or min(values) >= target_ngx_architecture
+                or max(values) <= target_ngx_architecture
                 or not end <= failure_target <= end + 64
             ):
                 continue
-            success = find_success_target(data, end, failure_target)
+            success = find_success_target(
+                data, end, failure_target, target_ngx_architecture
+            )
             if success is not None:
-                candidates.append((ada_offset, register, failure_target, success))
+                candidates.append((target_offset, register, failure_target, success))
     candidates = list(dict.fromkeys(candidates))
     if not candidates:
         raise PatchError("Cannot find a supported GPU architecture case table.")
     return candidates
 
 
-def patch_ada_cases(data: bytearray) -> tuple[ArchitectureCasePatch, ...]:
-    candidates = find_architecture_cases(data)
+def patch_architecture_cases(
+    data: bytearray, architectures: Sequence[Architecture]
+) -> tuple[ArchitectureCasePatch, ...]:
+    pending: list[tuple[Architecture, int, int, int]] = []
+    seen_architectures: set[int] = set()
+    for architecture in architectures:
+        if architecture.ngx in seen_architectures:
+            continue
+        seen_architectures.add(architecture.ngx)
+        try:
+            candidates = find_architecture_cases(data, architecture.ngx)
+        except PatchError as error:
+            raise PatchError(
+                f"Cannot find a supported {architecture.name.title()} GPU "
+                "architecture case table."
+            ) from error
+        pending.extend(
+            (architecture, offset, register, success)
+            for offset, register, _failure, success in candidates
+        )
+
     patches: list[ArchitectureCasePatch] = []
-    for ada_offset, register, _failure, success in candidates:
-        # Redirect the Ada entry to the existing success block. Both the short
-        # and near forms keep the replacement seven bytes long.
+    for architecture, offset, register, success in pending:
+        # Redirect the selected entry to the existing success block. Both the
+        # short and near forms keep the replacement seven bytes long.
         xor_modrm = 0xC0 | (register << 3) | register
-        displacement = success - (ada_offset + 7)
+        displacement = success - (offset + 7)
         if -128 <= displacement <= 127:
             replacement = bytes(
                 (0x33, xor_modrm, 0x90, 0x90, 0x90, 0xEB, displacement & 0xFF)
@@ -1141,10 +1213,17 @@ def patch_ada_cases(data: bytearray) -> tuple[ArchitectureCasePatch, ...]:
                 "<i", displacement
             )
         else:
-            raise PatchError("An Ada success target is out of range.")
-        data[ada_offset : ada_offset + 7] = replacement
-        patches.append(ArchitectureCasePatch(ada_offset, success))
+            raise PatchError(
+                f"A {architecture.name.title()} success target is out of range."
+            )
+        data[offset : offset + 7] = replacement
+        patches.append(ArchitectureCasePatch(offset, success, architecture.name))
     return tuple(patches)
+
+
+def patch_ada_cases(data: bytearray) -> tuple[ArchitectureCasePatch, ...]:
+    """Patch Ada case tables for callers that use the former helper."""
+    return patch_architecture_cases(data, (ADA,))
 
 
 def patch_ada_case(data: bytearray) -> tuple[int, int]:
@@ -1157,21 +1236,44 @@ def patch_ada_case(data: bytearray) -> tuple[int, int]:
     return patches[0].offset, patches[0].success_offset
 
 
-def apply_host_patches(data: bytearray) -> HostPatchResult:
+def apply_host_patches(
+    data: bytearray, architectures: Sequence[Architecture] = (ADA,)
+) -> HostPatchResult:
+    if not architectures:
+        raise PatchError("At least one target architecture is required.")
+    minimum_architecture = min(architectures, key=lambda architecture: architecture.ngx)
     sections = read_pe_sections(data)
     exports = read_pe_exports(data, sections)
-    requirements = patch_minimum_architectures(data, sections, exports)
-    architecture_export = patch_exported_architecture(data, sections, exports)
-    lower_architecture = any(
-        patch.previous_value > TARGET_NGX_ARCH for patch in requirements
-    ) or (architecture_export is not None and architecture_export[1] > TARGET_NGX_ARCH)
-    metadata_offsets = patch_architecture_metadata(
-        data, lower_architecture=lower_architecture
+    requirements = patch_minimum_architectures(
+        data, sections, exports, minimum_architecture.ngx
     )
-    ada_cases = patch_ada_cases(data)
+    architecture_export = patch_exported_architecture(
+        data, sections, exports, minimum_architecture.ngx
+    )
+    previous_architectures = [patch.previous_value for patch in requirements]
+    if architecture_export is not None:
+        previous_architectures.append(architecture_export[1])
+    lower_architecture = any(
+        previous > minimum_architecture.ngx for previous in previous_architectures
+    )
+    metadata_offsets = patch_architecture_metadata(
+        data,
+        lower_architecture=lower_architecture,
+        target_name=minimum_architecture.ngx_name,
+    )
+    enabled_architectures = tuple(
+        architecture
+        for architecture in architectures
+        if any(previous > architecture.ngx for previous in previous_architectures)
+    )
+    architecture_cases = (
+        patch_architecture_cases(data, enabled_architectures)
+        if enabled_architectures
+        else ()
+    )
     return HostPatchResult(
         requirements,
-        ada_cases,
+        architecture_cases,
         architecture_export[0] if architecture_export is not None else None,
         metadata_offsets,
     )
@@ -1182,9 +1284,10 @@ def repack_fatbin(
     source_blob: bytes,
     tools: CudaTools,
     root: Path,
+    target: Architecture = ADA,
 ) -> tuple[bytes, TransformStats, int]:
     # Preserve every source ELF image, normalize source PTX line endings, and
-    # add one compiled Ada image. Repack instead of editing compressed bytes.
+    # add one compiled target image. Repack instead of editing compressed bytes.
     work_dir = root / f"fatbin_{index:02d}"
     work_dir.mkdir(parents=True, exist_ok=False)
     source_path = work_dir / "input.fatbin"
@@ -1197,10 +1300,10 @@ def repack_fatbin(
             f"Fatbin {index} has {len(ptx_images)} PTX images. Exactly one is required."
         )
     if any(
-        image.kind == "elf" and image.architecture == TARGET_ARCH for image in images
+        image.kind == "elf" and image.architecture == target.cuda for image in images
     ):
         raise PatchError(
-            f"Fatbin {index} already contains an sm_{TARGET_ARCH} ELF image."
+            f"Fatbin {index} already contains a {target.cuda_name} ELF image."
         )
 
     source_ptx_image = ptx_images[0]
@@ -1219,22 +1322,22 @@ def repack_fatbin(
     ):
         raise PatchError(f"Fatbin {index} has no sm_{source_arch} ELF image.")
 
-    transformed_ptx, stats = transform_ptx(source_ptx)
-    transformed_path = work_dir / "ada.ptx"
+    transformed_ptx, stats = transform_ptx(source_ptx, target)
+    transformed_path = work_dir / f"{target.name}.ptx"
     transformed_path.write_bytes(transformed_ptx.encode("utf-8"))
-    ada_cubin = work_dir / f"ada.sm_{TARGET_ARCH}.cubin"
+    target_cubin = work_dir / f"{target.name}.{target.cuda_name}.cubin"
     run_tool(
         [
             tools.ptxas,
-            f"--gpu-name=sm_{TARGET_ARCH}",
+            f"--gpu-name={target.cuda_name}",
             transformed_path,
             "--output-file",
-            ada_cubin,
+            target_cubin,
         ]
     )
-    if not ada_cubin.is_file() or ada_cubin.stat().st_size == 0:
+    if not target_cubin.is_file() or target_cubin.stat().st_size == 0:
         raise PatchError(
-            f"ptxas did not create the sm_{TARGET_ARCH} cubin for fatbin {index}."
+            f"ptxas did not create the {target.cuda_name} cubin for fatbin {index}."
         )
 
     deterministic_images: list[Image] = []
@@ -1257,7 +1360,7 @@ def repack_fatbin(
         "--compress-all",
         "--create",
         output_path,
-        f"--image3=kind=elf,sm={TARGET_ARCH},file={ada_cubin}",
+        f"--image3=kind=elf,sm={target.cuda},file={target_cubin}",
     ]
     for image in deterministic_images:
         command.append(
@@ -1269,7 +1372,7 @@ def repack_fatbin(
     generated = preserve_record_flags(output_path.read_bytes(), source_blob)
 
     # Round-trip through cuobjdump and compare payloads. The rebuilt container
-    # must keep each ELF and normalized PTX payload, plus the expected Ada image.
+    # must keep each ELF and normalized PTX payload, plus the expected target image.
     verification_path = work_dir / "verified.fatbin"
     verification_path.write_bytes(generated)
     verification_dir = work_dir / "verification"
@@ -1284,7 +1387,7 @@ def repack_fatbin(
         if image.kind == "ptx":
             payload = canonical_ptx(payload)
         expected.setdefault((image.kind, image.architecture), []).append(payload)
-    expected.setdefault(("elf", TARGET_ARCH), []).append(ada_cubin.read_bytes())
+    expected.setdefault(("elf", target.cuda), []).append(target_cubin.read_bytes())
 
     for image in verified_images:
         key = (image.kind, image.architecture)
@@ -1308,7 +1411,7 @@ def repack_fatbin(
         raise PatchError(
             f"Fatbin {index} lost these CUDA images: {', '.join(missing)}."
         )
-    return generated, stats, ada_cubin.stat().st_size
+    return generated, stats, target_cubin.stat().st_size
 
 
 def path_exists(path: Path) -> bool:
@@ -1443,6 +1546,7 @@ def patch_file(
     force: bool,
     dry_run: bool,
     work_dir: Path | None,
+    target: Architecture = ADA,
 ) -> None:
     input_path = input_path.resolve()
     if not input_path.is_file():
@@ -1458,7 +1562,7 @@ def patch_file(
     data = bytearray(source_bytes)
     authenticode = strip_authenticode(data)
     locations = find_fatbins(data)
-    host = apply_host_patches(data)
+    host = apply_host_patches(data, (target,))
 
     print(f"Input:  {input_path}")
     print(f"SHA-256: {sha256_bytes(source_bytes)}")
@@ -1480,8 +1584,14 @@ def patch_file(
     requirements = ", ".join(
         f"{patch.interface}@0x{patch.offset:x}" for patch in host.requirements
     )
-    ada_cases = ", ".join(f"0x{patch.offset:x}" for patch in host.ada_cases)
-    print(f"Host:    requirements {requirements}; Ada cases {ada_cases}")
+    architecture_cases = ", ".join(
+        f"{patch.architecture}@0x{patch.offset:x}"
+        for patch in host.architecture_cases
+    )
+    print(
+        f"Host:    requirements {requirements}; architecture cases "
+        f"{architecture_cases or 'none'}"
+    )
     host_metadata = []
     if host.architecture_export_offset is not None:
         host_metadata.append(f"export@0x{host.architecture_export_offset:x}")
@@ -1493,7 +1603,9 @@ def patch_file(
 
     temporary_context: tempfile.TemporaryDirectory[str] | None = None
     if work_dir is None:
-        temporary_context = tempfile.TemporaryDirectory(prefix="dlssnr-ada-")
+        temporary_context = tempfile.TemporaryDirectory(
+            prefix=f"dlssnr-{target.name}-"
+        )
         build_root = Path(temporary_context.name)
     else:
         build_root = work_dir.resolve()
@@ -1509,7 +1621,7 @@ def patch_file(
         for index, location in enumerate(locations):
             source_blob = bytes(data[location.offset : location.offset + location.size])
             generated, stats, cubin_size = repack_fatbin(
-                index, source_blob, tools, build_root
+                index, source_blob, tools, build_root, target
             )
             if len(generated) > location.size:
                 raise PatchError(
@@ -1526,7 +1638,7 @@ def patch_file(
             print(
                 f"[{index + 1:02d}/{len(locations):02d}] "
                 f"0x{location.offset:x}: {location.size} -> {len(generated)} bytes; "
-                f"sm_{TARGET_ARCH} cubin {cubin_size} bytes; {stats.summary()}"
+                f"{target.cuda_name} cubin {cubin_size} bytes; {stats.summary()}"
             )
     finally:
         if temporary_context is not None:

@@ -475,6 +475,11 @@ min.relu.s32 %r10, %r11, %r12;
         self.assertIn("max.s32 %r10, %r10, 0;", output)
         self.assertEqual(stats.values["bulk_copy"], 1)
 
+    def test_transform_uses_selected_target(self) -> None:
+        output, _stats = patcher.transform_ptx(self.SOURCE, patcher.AMPERE)
+        self.assertIn(".target sm_86", output)
+        self.assertNotIn(".target sm_89", output)
+
     def test_transform_1024_byte_copy(self) -> None:
         source = self.SOURCE.replace("mov.b32 %r3, 512;", "mov.b32 %r3, 1024;")
         output, _stats = patcher.transform_ptx(source)
@@ -602,6 +607,30 @@ class HostCaseTests(unittest.TestCase):
             [(patch.offset, patch.success_offset) for patch in patches],
             [(first_ada, first_success), (second_ada, second_success)],
         )
+
+    def test_patch_selected_architecture_cases(self) -> None:
+        data = bytearray(b"\x90" * 16)
+        values = (0x140, 0x160, 0x170, 0x190, 0x180, 0x1A0)
+        start, _ada_case, success = self.add_case_table(data, values)
+        turing_case = start + values.index(patcher.TURING.ngx) * 7
+        ampere_case = start + values.index(patcher.AMPERE.ngx) * 7
+
+        patches = patcher.patch_architecture_cases(
+            data, (patcher.TURING, patcher.AMPERE)
+        )
+
+        self.assertEqual(
+            [
+                (patch.architecture, patch.offset, patch.success_offset)
+                for patch in patches
+            ],
+            [
+                ("turing", turing_case, success),
+                ("ampere", ampere_case, success),
+            ],
+        )
+        self.assertEqual(data[turing_case : turing_case + 2], b"\x33\xf6")
+        self.assertEqual(data[ampere_case : ampere_case + 2], b"\x33\xf6")
 
     def test_patch_ada_case_with_near_success_branch(self) -> None:
         data = bytearray(b"\x90" * 16)
