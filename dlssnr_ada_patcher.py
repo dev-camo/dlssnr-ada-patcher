@@ -1101,8 +1101,12 @@ SIMPLE_ASYNC_COPY_PATTERN = re.compile(
     r"\[(?P<destination>%r\d+)\],\s*\[(?P<source>%rd\d+)\],\s*"
     r"(?P<size>4|8|16)\s*;"
 )
-ASYNC_COMMIT_PATTERN = re.compile(r"cp\.async\.commit_group\s*;")
-ASYNC_WAIT_PATTERN = re.compile(r"cp\.async\.wait_group\s+0\s*;")
+ASYNC_COMMIT_PATTERN = re.compile(
+    rf"(?P<guard>@!?{PTX_PREDICATE}\s+)?cp\.async\.commit_group\s*;"
+)
+ASYNC_WAIT_PATTERN = re.compile(
+    rf"(?P<guard>@!?{PTX_PREDICATE}\s+)?cp\.async\.wait_group\s+0\s*;"
+)
 MBARRIER_INIT_PATTERN = re.compile(
     r"mbarrier\.init\.shared\.b64\s+\[(%r\d+)\],\s*(%r\d+)\s*;"
 )
@@ -1209,12 +1213,18 @@ def lower_turing_half_min_max(text: str, stats: TransformStats) -> str:
 def lower_turing_async_copies(text: str, stats: TransformStats) -> str:
     generic_count = len(re.findall(r"\bcp\.async(?:\.[^;\n]*)?\s*[^;\n]*;", text))
     copy_matches = list(SIMPLE_ASYNC_COPY_PATTERN.finditer(text))
+    commit_matches = list(ASYNC_COMMIT_PATTERN.finditer(text))
+    wait_matches = list(ASYNC_WAIT_PATTERN.finditer(text))
     copy_count = len(copy_matches)
-    commit_count = len(ASYNC_COMMIT_PATTERN.findall(text))
-    wait_count = len(ASYNC_WAIT_PATTERN.findall(text))
+    commit_count = len(commit_matches)
+    wait_count = len(wait_matches)
     if copy_count + commit_count + wait_count != generic_count:
         raise PatchError("An asynchronous copy has an unsupported form for Turing.")
-    if any(match.group("guard") for match in copy_matches):
+    if any(
+        match.group("guard")
+        for matches in (copy_matches, commit_matches, wait_matches)
+        for match in matches
+    ):
         raise PatchError("A predicated asynchronous copy is unsupported for Turing.")
     if commit_count != wait_count:
         raise PatchError("Turing asynchronous copy groups are not paired.")

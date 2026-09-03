@@ -710,6 +710,17 @@ mbarrier.try_wait.shared::cta.b64 %p1, [%r18], %rd2;
         with self.assertRaisesRegex(patcher.PatchError, "predicated asynchronous copy"):
             patcher.transform_ptx(source, patcher.TURING)
 
+    def test_reject_predicated_turing_async_group_operations(self) -> None:
+        for instruction in ("cp.async.commit_group", "cp.async.wait_group"):
+            with self.subTest(instruction=instruction):
+                source = self.TURING_SOURCE.replace(
+                    instruction, f"@%p2 {instruction}"
+                )
+                with self.assertRaisesRegex(
+                    patcher.PatchError, "predicated asynchronous copy"
+                ):
+                    patcher.transform_ptx(source, patcher.TURING)
+
     def test_reject_unsupported_turing_mbarrier(self) -> None:
         source = self.TURING_SOURCE.replace(
             "mbarrier.init.shared.b64", "mbarrier.init.shared::cta.b64"
