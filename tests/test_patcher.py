@@ -1,3 +1,4 @@
+import io
 import os
 import stat
 import struct
@@ -23,6 +24,21 @@ def make_fatbin(*records: bytes) -> bytes:
 
 
 class OutputTests(unittest.TestCase):
+    def test_no_arguments_print_expanded_usage(self) -> None:
+        stderr = io.StringIO()
+        with (
+            mock.patch("sys.stderr", stderr),
+            mock.patch.object(patcher, "find_cuda_tools") as find_cuda_tools,
+        ):
+            result = patcher.main([])
+
+        self.assertEqual(result, 2)
+        self.assertIn("target architectures:", stderr.getvalue())
+        self.assertIn("Build for every supported RTX generation", stderr.getvalue())
+        self.assertIn("--turing --ampere", stderr.getvalue())
+        self.assertIn("error: an input DLL path is required", stderr.getvalue())
+        find_cuda_tools.assert_not_called()
+
     def test_short_output_flag(self) -> None:
         arguments = patcher.build_parser().parse_args(
             ["nvngx_dlssnr.dll", "-o", "patched.dll"]

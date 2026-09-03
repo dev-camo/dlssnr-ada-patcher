@@ -2454,10 +2454,23 @@ def selected_architectures(args: argparse.Namespace) -> tuple[Architecture, ...]
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Add selected CUDA architectures and enable their NGX paths in a "
-            "user-supplied nvngx_dlssnr.dll. All supported RTX generations are "
+            "Add selected CUDA architectures and enable their NGX paths in a\n"
+            "user-supplied nvngx_dlssnr.dll. All supported RTX generations are\n"
             "selected when no architecture flags are given."
-        )
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=r"""examples:
+  Build for every supported RTX generation (default):
+    python %(prog)s "C:\path\to\nvngx_dlssnr.dll"
+
+  Build only the Turing and Ampere targets:
+    python %(prog)s --turing --ampere "C:\path\to\nvngx_dlssnr.dll"
+
+  Compile and verify without writing a file:
+    python %(prog)s --dry-run "C:\path\to\nvngx_dlssnr.dll"
+
+Architecture flags can be combined. Omit all four to build Turing, Ampere,
+Ada, and Blackwell targets together.""",
     )
     parser.add_argument(
         "input", type=Path, help="Path to the original nvngx_dlssnr.dll"
@@ -2518,7 +2531,12 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
-    args = parser.parse_args(argv)
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    if not arguments:
+        parser.print_help(sys.stderr)
+        print("\nerror: an input DLL path is required.", file=sys.stderr)
+        return 2
+    args = parser.parse_args(arguments)
     try:
         tools = find_cuda_tools(args.cuda_bin)
         patch_file(
