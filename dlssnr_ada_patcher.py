@@ -635,6 +635,423 @@ def previous_literal_assignment(
     return int(value)
 
 
+FP8_DOWN_PATTERN = re.compile(
+    r"cvt\.rn\.satfinite\.e4m3x2\.f16x2\s+"
+    r"(?P<destination>%rs\d+),\s*(?P<source>%r\d+)\s*;"
+)
+FP8_UP_PATTERN = re.compile(
+    r"cvt\.rn\.f16x2\.e4m3x2\s+"
+    r"(?P<destination>%r\d+),\s*(?P<source>%rs\d+)\s*;"
+)
+FP8_PACK_PATTERN = re.compile(
+    r"mov\.b32\s+(?P<destination>%r\d+),\s*"
+    r"\{\s*(?P<low>%rs\d+),\s*(?P<high>%rs\d+)\s*\}\s*;"
+)
+FP8_MMA_PATTERN = re.compile(
+    r"mma\.sync\.aligned\.m16n8k32\.row\.col\.f16\.e4m3\.e4m3\.f16\s*"
+    r"\{\s*(?P<d0>%r\d+),\s*(?P<d1>%r\d+)\s*\}\s*,\s*"
+    r"\{\s*(?P<a0>%r\d+),\s*(?P<a1>%r\d+),\s*"
+    r"(?P<a2>%r\d+),\s*(?P<a3>%r\d+)\s*\}\s*,\s*"
+    r"\{\s*(?P<b0>%r\d+),\s*(?P<b1>%r\d+)\s*\}\s*,\s*"
+    r"\{\s*(?P<c0>%r\d+),\s*(?P<c1>%r\d+)\s*\}\s*;"
+)
+PTX_ENTRY_PATTERN = re.compile(r"(?m)^\s*(?:\.visible\s+)?\.entry\b")
+
+
+def ptx_register_count(text: str, register: str) -> int:
+    return len(re.findall(re.escape(register) + r"(?!\d)", text))
+
+
+def fp8_pair_to_half_lines(source: str, destination: str) -> list[str]:
+    lines: list[str] = []
+    for bit_offset in (0, 8):
+        lines.extend(
+            [
+                f"bfe.u32 dlssnr_fp8_value, {source}, {bit_offset}, 8;",
+                "and.b32 dlssnr_fp8_abs, dlssnr_fp8_value, 0x7f;",
+                "and.b32 dlssnr_fp8_sign, dlssnr_fp8_value, 0x80;",
+                "shl.b32 dlssnr_fp8_sign, dlssnr_fp8_sign, 8;",
+                "add.u32 dlssnr_fp8_normal, dlssnr_fp8_abs, 0x40;",
+                "shl.b32 dlssnr_fp8_normal, dlssnr_fp8_normal, 7;",
+                "or.b32 dlssnr_fp8_normal, dlssnr_fp8_normal, "
+                "dlssnr_fp8_sign;",
+                "and.b32 dlssnr_fp8_mantissa, dlssnr_fp8_abs, 7;",
+                "bfind.u32 dlssnr_fp8_msb, dlssnr_fp8_mantissa;",
+                "sub.u32 dlssnr_fp8_shift, 10, dlssnr_fp8_msb;",
+                "shl.b32 dlssnr_fp8_mantissa, dlssnr_fp8_mantissa, "
+                "dlssnr_fp8_shift;",
+                "and.b32 dlssnr_fp8_mantissa, dlssnr_fp8_mantissa, 0x3ff;",
+                "add.u32 dlssnr_fp8_exponent, dlssnr_fp8_msb, 6;",
+                "shl.b32 dlssnr_fp8_exponent, dlssnr_fp8_exponent, 10;",
+                "or.b32 dlssnr_fp8_subnormal, dlssnr_fp8_sign, "
+                "dlssnr_fp8_exponent;",
+                "or.b32 dlssnr_fp8_subnormal, dlssnr_fp8_subnormal, "
+                "dlssnr_fp8_mantissa;",
+                "and.b32 dlssnr_fp8_exponent, dlssnr_fp8_abs, 0x78;",
+                "setp.eq.u32 dlssnr_fp8_exp_zero, dlssnr_fp8_exponent, 0;",
+                "setp.eq.u32 dlssnr_fp8_zero, dlssnr_fp8_abs, 0;",
+                "setp.eq.u32 dlssnr_fp8_nan, dlssnr_fp8_abs, 0x7f;",
+                "selp.b32 dlssnr_fp8_result, dlssnr_fp8_subnormal, "
+                "dlssnr_fp8_normal, dlssnr_fp8_exp_zero;",
+                "selp.b32 dlssnr_fp8_result, dlssnr_fp8_sign, "
+                "dlssnr_fp8_result, dlssnr_fp8_zero;",
+                "selp.b32 dlssnr_fp8_result, 0x7fff, "
+                "dlssnr_fp8_result, dlssnr_fp8_nan;",
+            ]
+        )
+        if bit_offset == 0:
+            lines.append("mov.b32 dlssnr_fp8_low, dlssnr_fp8_result;")
+        else:
+            lines.extend(
+                [
+                    "shl.b32 dlssnr_fp8_result, dlssnr_fp8_result, 16;",
+                    f"or.b32 {destination}, dlssnr_fp8_low, "
+                    "dlssnr_fp8_result;",
+                ]
+            )
+    return lines
+
+
+def half_pair_to_fp8_lines(source: str, destination: str) -> list[str]:
+    lines = [f"mov.b32 dlssnr_f16_source, {source};"]
+    for bit_offset in (0, 16):
+        lines.extend(
+            [
+                f"bfe.u32 dlssnr_f16_value, dlssnr_f16_source, "
+                f"{bit_offset}, 16;",
+                "and.b32 dlssnr_f16_sign, dlssnr_f16_value, 0x8000;",
+                "shr.u32 dlssnr_f16_sign, dlssnr_f16_sign, 8;",
+                "and.b32 dlssnr_f16_abs, dlssnr_f16_value, 0x7fff;",
+                "shr.u32 dlssnr_f16_normal, dlssnr_f16_abs, 7;",
+                "sub.u32 dlssnr_f16_normal, dlssnr_f16_normal, 0x40;",
+                "and.b32 dlssnr_f16_remainder, dlssnr_f16_abs, 0x7f;",
+                "and.b32 dlssnr_f16_lsb, dlssnr_f16_normal, 1;",
+                "setp.gt.u32 dlssnr_f16_gt, dlssnr_f16_remainder, 0x40;",
+                "setp.eq.u32 dlssnr_f16_eq, dlssnr_f16_remainder, 0x40;",
+                "setp.ne.u32 dlssnr_f16_odd, dlssnr_f16_lsb, 0;",
+                "and.pred dlssnr_f16_tie, dlssnr_f16_eq, dlssnr_f16_odd;",
+                "or.pred dlssnr_f16_round, dlssnr_f16_gt, dlssnr_f16_tie;",
+                "selp.b32 dlssnr_f16_increment, 1, 0, dlssnr_f16_round;",
+                "add.u32 dlssnr_f16_normal, dlssnr_f16_normal, "
+                "dlssnr_f16_increment;",
+                "shr.u32 dlssnr_f16_exponent, dlssnr_f16_abs, 10;",
+                "and.b32 dlssnr_f16_exponent, dlssnr_f16_exponent, 0x1f;",
+                "and.b32 dlssnr_f16_mantissa, dlssnr_f16_abs, 0x3ff;",
+                "or.b32 dlssnr_f16_mantissa, dlssnr_f16_mantissa, 0x400;",
+                "sub.u32 dlssnr_f16_shift, 16, dlssnr_f16_exponent;",
+                "min.u32 dlssnr_f16_shift, dlssnr_f16_shift, 31;",
+                "shr.u32 dlssnr_f16_subnormal, dlssnr_f16_mantissa, "
+                "dlssnr_f16_shift;",
+                "shl.b32 dlssnr_f16_scale, 1, dlssnr_f16_shift;",
+                "sub.u32 dlssnr_f16_mask, dlssnr_f16_scale, 1;",
+                "and.b32 dlssnr_f16_remainder, dlssnr_f16_mantissa, "
+                "dlssnr_f16_mask;",
+                "shr.u32 dlssnr_f16_half, dlssnr_f16_scale, 1;",
+                "and.b32 dlssnr_f16_lsb, dlssnr_f16_subnormal, 1;",
+                "setp.gt.u32 dlssnr_f16_gt, dlssnr_f16_remainder, "
+                "dlssnr_f16_half;",
+                "setp.eq.u32 dlssnr_f16_eq, dlssnr_f16_remainder, "
+                "dlssnr_f16_half;",
+                "setp.ne.u32 dlssnr_f16_odd, dlssnr_f16_lsb, 0;",
+                "and.pred dlssnr_f16_tie, dlssnr_f16_eq, dlssnr_f16_odd;",
+                "or.pred dlssnr_f16_round, dlssnr_f16_gt, dlssnr_f16_tie;",
+                "selp.b32 dlssnr_f16_increment, 1, 0, dlssnr_f16_round;",
+                "add.u32 dlssnr_f16_subnormal, dlssnr_f16_subnormal, "
+                "dlssnr_f16_increment;",
+                "setp.lt.u32 dlssnr_f16_denormal, dlssnr_f16_abs, 0x2400;",
+                "setp.le.u32 dlssnr_f16_underflow, dlssnr_f16_abs, 0x1400;",
+                "setp.gt.u32 dlssnr_f16_overflow, dlssnr_f16_abs, 0x5f40;",
+                "setp.gt.u32 dlssnr_f16_nan, dlssnr_f16_abs, 0x7c00;",
+                "selp.b32 dlssnr_f16_result, dlssnr_f16_subnormal, "
+                "dlssnr_f16_normal, dlssnr_f16_denormal;",
+                "selp.b32 dlssnr_f16_result, 0, dlssnr_f16_result, "
+                "dlssnr_f16_underflow;",
+                "selp.b32 dlssnr_f16_result, 0x7e, dlssnr_f16_result, "
+                "dlssnr_f16_overflow;",
+                "or.b32 dlssnr_f16_result, dlssnr_f16_result, "
+                "dlssnr_f16_sign;",
+                "selp.b32 dlssnr_f16_result, 0x7f, dlssnr_f16_result, "
+                "dlssnr_f16_nan;",
+            ]
+        )
+        if bit_offset == 0:
+            lines.append("mov.b32 dlssnr_f16_low, dlssnr_f16_result;")
+        else:
+            lines.extend(
+                [
+                    "shl.b32 dlssnr_f16_result, dlssnr_f16_result, 8;",
+                    "or.b32 dlssnr_f16_result, dlssnr_f16_low, "
+                    "dlssnr_f16_result;",
+                    f"cvt.u16.u32 {destination}, dlssnr_f16_result;",
+                ]
+            )
+    return lines
+
+
+def fp8_conversion_declarations() -> list[str]:
+    return [
+        ".reg .b32 dlssnr_fp8_value, dlssnr_fp8_abs, dlssnr_fp8_sign;",
+        ".reg .b32 dlssnr_fp8_normal, dlssnr_fp8_mantissa;",
+        ".reg .b32 dlssnr_fp8_msb, dlssnr_fp8_shift, dlssnr_fp8_exponent;",
+        ".reg .b32 dlssnr_fp8_subnormal, dlssnr_fp8_result, dlssnr_fp8_low;",
+        ".reg .pred dlssnr_fp8_exp_zero, dlssnr_fp8_zero, dlssnr_fp8_nan;",
+    ]
+
+
+def half_conversion_declarations() -> list[str]:
+    return [
+        ".reg .b32 dlssnr_f16_source, dlssnr_f16_value, dlssnr_f16_abs;",
+        ".reg .b32 dlssnr_f16_sign, dlssnr_f16_normal, dlssnr_f16_remainder;",
+        ".reg .b32 dlssnr_f16_lsb, dlssnr_f16_increment, dlssnr_f16_exponent;",
+        ".reg .b32 dlssnr_f16_mantissa, dlssnr_f16_shift, dlssnr_f16_scale;",
+        ".reg .b32 dlssnr_f16_mask, dlssnr_f16_half, dlssnr_f16_subnormal;",
+        ".reg .b32 dlssnr_f16_result, dlssnr_f16_low;",
+        ".reg .pred dlssnr_f16_gt, dlssnr_f16_eq, dlssnr_f16_odd;",
+        ".reg .pred dlssnr_f16_tie, dlssnr_f16_round;",
+        ".reg .pred dlssnr_f16_denormal, dlssnr_f16_underflow;",
+        ".reg .pred dlssnr_f16_overflow, dlssnr_f16_nan;",
+    ]
+
+
+def fp8_pack_sources(text: str) -> dict[str, tuple[str, str, int]]:
+    down_sources: dict[str, list[str]] = {}
+    for match in FP8_DOWN_PATTERN.finditer(text):
+        down_sources.setdefault(match.group("destination"), []).append(
+            match.group("source")
+        )
+
+    packed_sources: dict[str, list[tuple[str, str, int]]] = {}
+    for match in FP8_PACK_PATTERN.finditer(text):
+        low_sources = down_sources.get(match.group("low"), [])
+        high_sources = down_sources.get(match.group("high"), [])
+        if len(low_sources) == len(high_sources) == 1:
+            packed_sources.setdefault(match.group("destination"), []).append(
+                (low_sources[0], high_sources[0], match.start())
+            )
+    return {
+        register: sources[0]
+        for register, sources in packed_sources.items()
+        if len(sources) == 1
+    }
+
+
+def render_fp8_mma_run(
+    matches: Sequence[re.Match[str]],
+    packed_sources: dict[str, tuple[str, str, int]],
+) -> str:
+    operands: list[str] = []
+    for match in matches:
+        for name in ("a0", "a1", "a2", "a3", "b0", "b1"):
+            register = match.group(name)
+            if register not in operands:
+                operands.append(register)
+    names = {
+        register: (f"dlssnr_fp16_{index}_0", f"dlssnr_fp16_{index}_1")
+        for index, register in enumerate(operands)
+    }
+    mapped = {
+        register: sources
+        for register, sources in packed_sources.items()
+        if sources[2] < matches[0].start()
+    }
+    has_encoded_operands = any(register not in mapped for register in operands)
+
+    lines = ["{"]
+    lines.extend(
+        [
+            ".reg .u32 dlssnr_lane, dlssnr_group, dlssnr_pair;",
+            ".reg .u32 dlssnr_source0, dlssnr_source1, dlssnr_parity;",
+            ".reg .b32 dlssnr_shuffle0, dlssnr_shuffle1, dlssnr_shifted;",
+            ".reg .b32 dlssnr_selected;",
+            ".reg .pred dlssnr_high;",
+            ".reg .b32 "
+            + ", ".join(name for pair in names.values() for name in pair)
+            + ";",
+        ]
+    )
+    if has_encoded_operands:
+        lines.extend(fp8_conversion_declarations())
+    lines.extend(
+        [
+            "mov.u32 dlssnr_lane, %laneid;",
+            "and.b32 dlssnr_group, dlssnr_lane, 0x1c;",
+            "shr.u32 dlssnr_pair, dlssnr_lane, 1;",
+            "and.b32 dlssnr_pair, dlssnr_pair, 1;",
+            "add.u32 dlssnr_source0, dlssnr_group, dlssnr_pair;",
+            "add.u32 dlssnr_source1, dlssnr_source0, 2;",
+            "and.b32 dlssnr_parity, dlssnr_lane, 1;",
+            "setp.ne.u32 dlssnr_high, dlssnr_parity, 0;",
+        ]
+    )
+
+    for register in operands:
+        first, second = names[register]
+        if register in mapped:
+            low, high, _position = mapped[register]
+            for source_index, destination in (
+                ("dlssnr_source0", first),
+                ("dlssnr_source1", second),
+            ):
+                lines.extend(
+                    [
+                        "shfl.sync.idx.b32 dlssnr_shuffle0, "
+                        f"{low}, {source_index}, 0x1f, 0xffffffff;",
+                        "shfl.sync.idx.b32 dlssnr_shuffle1, "
+                        f"{high}, {source_index}, 0x1f, 0xffffffff;",
+                        f"selp.b32 {destination}, dlssnr_shuffle1, "
+                        "dlssnr_shuffle0, dlssnr_high;",
+                    ]
+                )
+        else:
+            for source_index, destination in (
+                ("dlssnr_source0", first),
+                ("dlssnr_source1", second),
+            ):
+                lines.extend(
+                    [
+                        "shfl.sync.idx.b32 dlssnr_shuffle0, "
+                        f"{register}, {source_index}, 0x1f, 0xffffffff;",
+                        "shr.u32 dlssnr_shifted, dlssnr_shuffle0, 16;",
+                        "selp.b32 dlssnr_selected, dlssnr_shifted, "
+                        "dlssnr_shuffle0, dlssnr_high;",
+                    ]
+                )
+                lines.extend(fp8_pair_to_half_lines("dlssnr_selected", destination))
+
+    for match in matches:
+        d0, d1 = match.group("d0"), match.group("d1")
+        c0, c1 = match.group("c0"), match.group("c1")
+        a0, a1 = names[match.group("a0")]
+        a2, a3 = names[match.group("a1")]
+        a4, a5 = names[match.group("a2")]
+        a6, a7 = names[match.group("a3")]
+        b0, b1 = names[match.group("b0")]
+        b2, b3 = names[match.group("b1")]
+        lines.extend(
+            [
+                "mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 "
+                f"{{{d0}, {d1}}}, {{{a0}, {a2}, {a1}, {a3}}}, "
+                f"{{{b0}, {b1}}}, {{{c0}, {c1}}};",
+                "mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 "
+                f"{{{d0}, {d1}}}, {{{a4}, {a6}, {a5}, {a7}}}, "
+                f"{{{b2}, {b3}}}, {{{d0}, {d1}}};",
+            ]
+        )
+    lines.append("}")
+    return "\n".join(lines)
+
+
+def lower_fp8_mma_entry(text: str) -> tuple[str, int]:
+    matches = list(FP8_MMA_PATTERN.finditer(text))
+    if not matches:
+        return text, 0
+    runs: list[list[re.Match[str]]] = [[matches[0]]]
+    for match in matches[1:]:
+        if text[runs[-1][-1].end() : match.start()].strip():
+            runs.append([match])
+        else:
+            runs[-1].append(match)
+
+    packed_sources = fp8_pack_sources(text)
+    replacements = [
+        (
+            run[0].start(),
+            run[-1].end(),
+            render_fp8_mma_run(run, packed_sources),
+        )
+        for run in runs
+    ]
+    for start, end, replacement in reversed(replacements):
+        text = text[:start] + replacement + text[end:]
+
+    text = FP8_PACK_PATTERN.sub(
+        lambda match: ""
+        if ptx_register_count(text, match.group("destination")) == 1
+        else match.group(0),
+        text,
+    )
+    text = FP8_DOWN_PATTERN.sub(
+        lambda match: ""
+        if ptx_register_count(text, match.group("destination")) == 1
+        else match.group(0),
+        text,
+    )
+    return text, len(matches)
+
+
+def lower_fp8_mma(text: str) -> tuple[str, int]:
+    starts = [match.start() for match in PTX_ENTRY_PATTERN.finditer(text)]
+    if not starts:
+        return lower_fp8_mma_entry(text)
+    boundaries = [0, *starts, len(text)]
+    parts: list[str] = []
+    count = 0
+    for start, end in zip(boundaries, boundaries[1:]):
+        part, part_count = lower_fp8_mma_entry(text[start:end])
+        parts.append(part)
+        count += part_count
+    return "".join(parts), count
+
+
+def lower_fp8_conversions(text: str, stats: TransformStats) -> str:
+    generic_down_count = len(
+        re.findall(r"\bcvt\.[^;\n]*\.e4m3x2\.f16x2\b", text)
+    )
+    generic_up_count = len(
+        re.findall(r"\bcvt\.[^;\n]*\.f16x2\.e4m3x2\b", text)
+    )
+    down_count = len(FP8_DOWN_PATTERN.findall(text))
+    up_count = len(FP8_UP_PATTERN.findall(text))
+    if down_count != generic_down_count:
+        raise PatchError("An FP16-to-FP8 conversion has an unsupported form.")
+    if up_count != generic_up_count:
+        raise PatchError("An FP8-to-FP16 conversion has an unsupported form.")
+
+    def replace_down(match: re.Match[str]) -> str:
+        lines = ["{", *half_conversion_declarations()]
+        lines.extend(
+            half_pair_to_fp8_lines(
+                match.group("source"), match.group("destination")
+            )
+        )
+        lines.append("}")
+        return "\n".join(lines)
+
+    def replace_up(match: re.Match[str]) -> str:
+        lines = ["{", ".reg .b32 dlssnr_fp8_source;"]
+        lines.extend(fp8_conversion_declarations())
+        lines.append(
+            f"cvt.u32.u16 dlssnr_fp8_source, {match.group('source')};"
+        )
+        lines.extend(
+            fp8_pair_to_half_lines(
+                "dlssnr_fp8_source", match.group("destination")
+            )
+        )
+        lines.append("}")
+        return "\n".join(lines)
+
+    text, down_count = FP8_DOWN_PATTERN.subn(replace_down, text)
+    text, up_count = FP8_UP_PATTERN.subn(replace_up, text)
+    stats.add("fp16_to_fp8", down_count)
+    stats.add("fp8_to_fp16", up_count)
+    return text
+
+
+def lower_fp8_operations(text: str, stats: TransformStats) -> str:
+    generic_mma_count = len(
+        re.findall(
+            r"\bmma\.[^;]*\.f16\.e4m3\.e4m3\.f16\b", text, re.DOTALL
+        )
+    )
+    exact_mma_count = len(FP8_MMA_PATTERN.findall(text))
+    if exact_mma_count != generic_mma_count:
+        raise PatchError("An FP8 matrix operation has an unsupported form.")
+    text, mma_count = lower_fp8_mma(text)
+    stats.add("fp8_mma", mma_count)
+    return lower_fp8_conversions(text, stats)
+
+
 def transform_ptx(
     source: str, target: Architecture = ADA
 ) -> tuple[str, TransformStats]:
@@ -671,6 +1088,9 @@ def transform_ptx(
         )
     output = target_pattern.sub(rf"\g<1>{target.cuda_name}\2", output)
     stats.add("target", 1)
+
+    if target.cuda < ADA.cuda:
+        output = lower_fp8_operations(output, stats)
 
     # Pre-Blackwell targets have no equivalent for the newer warp bulk-copy
     # instruction. Accept only ordered elect/copy/expect groups whose barrier
@@ -800,7 +1220,7 @@ def transform_ptx(
     output, expect_count = expect_pattern.subn("", output)
     stats.add("expect_tx", expect_count)
 
-    # Use Ada's one-arrival and test-wait barrier forms.
+    # Use the pre-Blackwell one-arrival and test-wait barrier forms.
     output, arrive_count = arrive_pattern.subn(
         r"mbarrier.arrive.shared::cta.b64 \1, [\2];", output
     )
@@ -810,7 +1230,7 @@ def transform_ptx(
     )
     stats.add("barrier_wait", wait_count)
 
-    # Ada does not support the four-value vector reduction. Preserve its four
+    # Older targets do not support the four-value vector reduction. Preserve its
     # values as separate packed-half reductions at adjacent addresses.
     reduction_pattern = re.compile(
         r"red\.global\.v4\.f16x2\.add\.noftz\s+\[(%rd\d+)\],\s*"
@@ -828,12 +1248,13 @@ def transform_ptx(
     output, reduction_count = reduction_pattern.subn(replace_reduction, output)
     stats.add("vector_reduction", reduction_count)
 
-    # Use the acquire-release fence accepted by Ada in place of release-only.
+    # Use the acquire-release fence accepted by older targets in place of
+    # release-only.
     fence_count = output.count("fence.release.gpu;")
     output = output.replace("fence.release.gpu;", "fence.acq_rel.gpu;")
     stats.add("release_fence", fence_count)
 
-    # Expand fused signed minimum/ReLU into operations that Ada supports.
+    # Expand fused signed minimum/ReLU into operations older targets support.
     min_relu_pattern = re.compile(r"min\.relu\.s32\s+(%r\d+),\s*(%r\d+),\s*(%r\d+)\s*;")
     output, min_relu_count = min_relu_pattern.subn(
         r"min.s32 \1, \2, \3;\nmax.s32 \1, \1, 0;", output
@@ -849,6 +1270,8 @@ def transform_ptx(
         "min.relu",
         "fence.release.gpu",
     )
+    if target.cuda < ADA.cuda:
+        unsupported += ("e4m3",)
     remaining = [token for token in unsupported if token in output]
     if remaining:
         raise PatchError(
@@ -1358,6 +1781,7 @@ def repack_fatbin(
         tools.fatbinary,
         "--64",
         "--compress-all",
+        "--compress-mode=size",
         "--create",
         output_path,
         f"--image3=kind=elf,sm={target.cuda},file={target_cubin}",

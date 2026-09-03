@@ -461,6 +461,18 @@ red.global.v4.f16x2.add.noftz [%rd3], {%r5, %r6, %r7, %r8};
 fence.release.gpu;
 min.relu.s32 %r10, %r11, %r12;
 """
+    FP8_SOURCE = """
+.version 9.4
+.target sm_120
+.address_size 64
+cvt.rn.satfinite.e4m3x2.f16x2 %rs1, %r10;
+cvt.rn.satfinite.e4m3x2.f16x2 %rs2, %r11;
+mov.b32 %r20, {%rs1, %rs2};
+mov.b16 %rs8, %rs1;
+cvt.rn.f16x2.e4m3x2 %r30, %rs9;
+mma.sync.aligned.m16n8k32.row.col.f16.e4m3.e4m3.f16
+    {%r40, %r41}, {%r20, %r21, %r22, %r23}, {%r24, %r25}, {%r26, %r27};
+"""
 
     def test_transform_supported_operations(self) -> None:
         output, stats = patcher.transform_ptx(self.SOURCE)
@@ -479,6 +491,39 @@ min.relu.s32 %r10, %r11, %r12;
         output, _stats = patcher.transform_ptx(self.SOURCE, patcher.AMPERE)
         self.assertIn(".target sm_86", output)
         self.assertNotIn(".target sm_89", output)
+
+    def test_transform_ampere_fp8_operations(self) -> None:
+        output, stats = patcher.transform_ptx(self.FP8_SOURCE, patcher.AMPERE)
+
+        self.assertNotIn(".e4m3", output)
+        self.assertEqual(
+            output.count(
+                "mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16"
+            ),
+            2,
+        )
+        self.assertIn("shfl.sync.idx.b32", output)
+        self.assertIn("cvt.u32.u16 dlssnr_fp8_source, %rs9;", output)
+        self.assertEqual(stats.values["fp8_mma"], 1)
+        self.assertEqual(stats.values["fp16_to_fp8"], 1)
+        self.assertEqual(stats.values["fp8_to_fp16"], 1)
+
+    def test_transform_ada_keeps_native_fp8_operations(self) -> None:
+        output, stats = patcher.transform_ptx(self.FP8_SOURCE, patcher.ADA)
+        self.assertIn(".e4m3", output)
+        self.assertNotIn("fp8_mma", stats.values)
+
+    def test_reject_unsupported_fp8_matrix_shape(self) -> None:
+        source = self.FP8_SOURCE.replace(".m16n8k32.row.col", ".m16n8k32.col.row")
+        with self.assertRaisesRegex(patcher.PatchError, "FP8 matrix operation"):
+            patcher.transform_ptx(source, patcher.AMPERE)
+
+    def test_reject_unsupported_fp8_conversion(self) -> None:
+        source = self.FP8_SOURCE.replace(
+            "cvt.rn.f16x2.e4m3x2", "cvt.rn.relu.f16x2.e4m3x2"
+        )
+        with self.assertRaisesRegex(patcher.PatchError, "FP8-to-FP16 conversion"):
+            patcher.transform_ptx(source, patcher.AMPERE)
 
     def test_transform_1024_byte_copy(self) -> None:
         source = self.SOURCE.replace("mov.b32 %r3, 512;", "mov.b32 %r3, 1024;")
