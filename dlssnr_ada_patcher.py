@@ -1067,6 +1067,7 @@ def lower_fp8_operations(text: str, stats: TransformStats) -> str:
 
 F16_MMA_REGISTER = r"(?:%r\d+|dlssnr_fp16_\d+_[01])"
 F16_MMA_PATTERN = re.compile(
+    r"(?P<guard>@!?%p\d+\s+)?"
     r"mma\.sync\.aligned\.m16n8k16\.row\.col\.f16\.f16\.f16\.f16\s*"
     r"\{\s*(?P<d0>%r\d+),\s*(?P<d1>%r\d+)\s*\}\s*,\s*"
     rf"\{{\s*(?P<a0>{F16_MMA_REGISTER}),\s*"
@@ -1110,9 +1111,11 @@ def lower_turing_mma(text: str, stats: TransformStats) -> str:
             re.DOTALL,
         )
     )
-    exact_count = len(F16_MMA_PATTERN.findall(text))
-    if exact_count != generic_count:
+    matches = list(F16_MMA_PATTERN.finditer(text))
+    if len(matches) != generic_count:
         raise PatchError("An FP16 matrix operation has an unsupported form.")
+    if any(match.group("guard") for match in matches):
+        raise PatchError("A predicated FP16 matrix operation is unsupported for Turing.")
 
     def replace(match: re.Match[str]) -> str:
         d0, d1 = match.group("d0"), match.group("d1")
