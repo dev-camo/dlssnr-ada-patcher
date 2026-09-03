@@ -223,6 +223,140 @@ class PeTests(unittest.TestCase):
         self.assertEqual(struct.unpack_from("<I", data, 0xD8)[0], 0xB20E)
         self.assertEqual(patcher.calculate_pe_checksum(data), 0xB20E)
 
+    def test_strip_authenticode_preserves_trailing_overlay(self) -> None:
+        data = self.make_two_section_pe()
+        leading_overlay = b"OVERLAY0"
+        data.extend(leading_overlay)
+        certificate_offset = len(data)
+
+        def certificate(payload: bytes) -> bytes:
+            size = 8 + len(payload)
+            entry = struct.pack("<IHH", size, 0x200, 2) + payload
+            return entry.ljust((size + 7) & ~7, b"\0")
+
+        certificate_table = certificate(b"first") + certificate(b"second entry")
+        data.extend(certificate_table)
+        trailing_overlay = b"data from a future DLL release"
+        data.extend(trailing_overlay)
+        original_size = len(data)
+        security_directory = 0x80 + 24 + 112 + 4 * 8
+        struct.pack_into(
+            "<II",
+            data,
+            security_directory,
+            certificate_offset,
+            len(certificate_table),
+        )
+
+        removal = patcher.strip_authenticode(data)
+
+        if removal is None:
+            self.fail("The certificate table was not removed.")
+        self.assertEqual(removal.offset, certificate_offset)
+        self.assertEqual(removal.size, len(certificate_table))
+        self.assertEqual(removal.certificate_count, 2)
+        self.assertEqual(removal.trailing_data_size, len(trailing_overlay))
+        self.assertEqual(len(data), original_size - len(certificate_table))
+        self.assertEqual(data[0x800:certificate_offset], leading_overlay)
+        self.assertEqual(data[certificate_offset:], trailing_overlay)
+        self.assertEqual(struct.unpack_from("<II", data, security_directory), (0, 0))
+
+    def test_strip_authenticode_accepts_unsigned_pe(self) -> None:
+        data = self.make_two_section_pe()
+        original = bytes(data)
+
+        self.assertIsNone(patcher.strip_authenticode(data))
+        self.assertEqual(data, original)
+
+    def test_strip_authenticode_rejects_partial_security_directory(self) -> None:
+        security_directory = 0x80 + 24 + 112 + 4 * 8
+        for certificate_offset, certificate_size in ((0, 8), (0x800, 0)):
+            with self.subTest(
+                offset=certificate_offset,
+                size=certificate_size,
+            ):
+                data = self.make_two_section_pe()
+                struct.pack_into(
+                    "<II",
+                    data,
+                    security_directory,
+                    certificate_offset,
+                    certificate_size,
+                )
+                original = bytes(data)
+
+                with self.assertRaisesRegex(
+                    patcher.PatchError, "security directory is invalid"
+                ):
+                    patcher.strip_authenticode(data)
+                self.assertEqual(data, original)
+
+    def test_strip_authenticode_rejects_misaligned_table(self) -> None:
+        data = self.make_two_section_pe()
+        data.extend(b"\0")
+        certificate_offset = len(data)
+        data.extend(struct.pack("<IHH", 8, 0x200, 2))
+        security_directory = 0x80 + 24 + 112 + 4 * 8
+        struct.pack_into("<II", data, security_directory, certificate_offset, 8)
+        original = bytes(data)
+
+        with self.assertRaisesRegex(patcher.PatchError, "not 8-byte aligned"):
+            patcher.strip_authenticode(data)
+        self.assertEqual(data, original)
+
+    def test_strip_authenticode_rejects_short_entry_length(self) -> None:
+        data = self.make_two_section_pe()
+        certificate_offset = len(data)
+        data.extend(struct.pack("<IHH", 7, 0x200, 2))
+        security_directory = 0x80 + 24 + 112 + 4 * 8
+        struct.pack_into("<II", data, security_directory, certificate_offset, 8)
+        original = bytes(data)
+
+        with self.assertRaisesRegex(patcher.PatchError, "invalid entry length"):
+            patcher.strip_authenticode(data)
+        self.assertEqual(data, original)
+
+    def test_strip_authenticode_rejects_trailing_entry_header(self) -> None:
+        data = self.make_two_section_pe()
+        certificate_offset = len(data)
+        certificate_table = struct.pack("<IHH", 8, 0x200, 2) + b"next"
+        data.extend(certificate_table)
+        security_directory = 0x80 + 24 + 112 + 4 * 8
+        struct.pack_into(
+            "<II",
+            data,
+            security_directory,
+            certificate_offset,
+            len(certificate_table),
+        )
+        original = bytes(data)
+
+        with self.assertRaisesRegex(patcher.PatchError, "truncated entry header"):
+            patcher.strip_authenticode(data)
+        self.assertEqual(data, original)
+
+    def test_strip_authenticode_rejects_table_in_section_data(self) -> None:
+        data = self.make_two_section_pe()
+        certificate_offset = 0x700
+        struct.pack_into("<IHH", data, certificate_offset, 8, 0x200, 2)
+        security_directory = 0x80 + 24 + 112 + 4 * 8
+        struct.pack_into("<II", data, security_directory, certificate_offset, 8)
+
+        with self.assertRaisesRegex(patcher.PatchError, "overlaps PE image data"):
+            patcher.strip_authenticode(data)
+
+    def test_strip_authenticode_rejects_truncated_entry(self) -> None:
+        data = self.make_two_section_pe()
+        certificate_offset = len(data)
+        data.extend(struct.pack("<IHH", 16, 0x200, 2))
+        security_directory = 0x80 + 24 + 112 + 4 * 8
+        struct.pack_into("<II", data, security_directory, certificate_offset, 8)
+        original = bytes(data)
+
+        with self.assertRaisesRegex(patcher.PatchError, "extends past its table"):
+            patcher.strip_authenticode(data)
+        self.assertEqual(data, original)
+
     def test_patch_all_exported_minimum_architectures(self) -> None:
         data = self.make_two_section_pe()
         interface_exports = [
